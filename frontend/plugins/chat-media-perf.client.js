@@ -1,4 +1,10 @@
-import { createPerfTrace, getLatestResourceTiming, logPerfChannel, nowPerfMs } from '~/lib/chat/perf-logger'
+import {
+  createPerfTrace,
+  getLatestResourceTiming,
+  isChatPerfLoggingEnabled,
+  logPerfChannel,
+  nowPerfMs
+} from '~/lib/chat/perf-logger'
 
 const CHAT_LAZY_SRC_EVENT = 'chat-lazy-src:start'
 const CHAT_LAZY_ROOT_MARGIN = '240px 0px 520px 0px'
@@ -64,11 +70,17 @@ const normalizeLazySrc = (value) => {
   return String(value || '').trim()
 }
 
+const normalizeLazyBinding = (value) => ({
+  src: normalizeLazySrc(value),
+  eager: !!(value && typeof value === 'object' && value.eager)
+})
+
 const ensureLazySrcState = (element) => {
   if (!element.__chatLazySrcState) {
     element.__chatLazySrcState = {
       src: '',
       loadedSrc: '',
+      eager: false,
       observer: null,
       timer: null,
       requestedAt: 0,
@@ -90,6 +102,34 @@ const cleanupLazySrcObserver = (element) => {
   if (state.timer) {
     try { clearTimeout(state.timer) } catch {}
     state.timer = null
+  }
+}
+
+const releaseLazySrc = (element) => {
+  const state = element?.__chatLazySrcState
+  cleanupLazySrcObserver(element)
+  if (!element) return
+
+  const tagName = String(element.tagName || '').toUpperCase()
+  if (tagName === 'VIDEO' || tagName === 'AUDIO') {
+    try { element.pause?.() } catch {}
+    try { element.removeAttribute('src') } catch {}
+    try {
+      for (const source of element.querySelectorAll?.('source') || []) {
+        source.removeAttribute?.('src')
+      }
+    } catch {}
+    try { element.load?.() } catch {}
+  } else {
+    // Changing/removing src releases Chromium's in-flight HTTP connection even
+    // when the backend is still finishing a remote media decode.
+    try { element.removeAttribute('src') } catch {}
+  }
+
+  try { element.removeAttribute('data-chat-lazy-src') } catch {}
+  if (state) {
+    state.src = ''
+    state.loadedSrc = ''
   }
 }
 
@@ -121,10 +161,11 @@ const applyLazySrc = (element, reason = '') => {
 
 const updateLazySrc = (element, binding, reason = '') => {
   const state = ensureLazySrcState(element)
-  const nextSrc = normalizeLazySrc(binding?.value)
+  const { src: nextSrc, eager } = normalizeLazyBinding(binding?.value)
 
   cleanupLazySrcObserver(element)
   state.src = nextSrc
+  state.eager = eager
   state.requestedAt = nowPerfMs()
   state.observerStartedAt = 0
   state.appliedAt = 0
@@ -136,10 +177,17 @@ const updateLazySrc = (element, binding, reason = '') => {
     return
   }
 
+  if (state.loadedSrc === nextSrc && readImageSrc(element) === nextSrc) return
+
   if (state.loadedSrc !== nextSrc || readImageSrc(element) !== nextSrc) {
     state.loadedSrc = ''
     try { element.removeAttribute('src') } catch {}
     try { element.setAttribute('data-chat-lazy-src', nextSrc) } catch {}
+  }
+
+  if (eager) {
+    applyLazySrc(element, `${reason}:eager`)
+    return
   }
 
   if (typeof window === 'undefined' || typeof window.IntersectionObserver !== 'function') {
@@ -234,6 +282,7 @@ const beginTracking = (element, binding, reason = '', lazyDetail = null) => {
 export default defineNuxtPlugin((nuxtApp) => {
   nuxtApp.vueApp.directive('chat-media-perf', {
     mounted(element, binding) {
+      if (!isChatPerfLoggingEnabled()) return
       const state = ensurePerfState(element)
       state.onLoad = () => finalizeTracking(element, 'load', 'load-event')
       state.onError = () => finalizeTracking(element, 'error', 'error-event')
@@ -245,6 +294,7 @@ export default defineNuxtPlugin((nuxtApp) => {
       logPendingLazy(element, binding, 'mounted')
     },
     updated(element, binding) {
+      if (!isChatPerfLoggingEnabled()) return
       const state = ensurePerfState(element)
       const nextSrc = readImageSrc(element)
       if (!nextSrc) {
@@ -278,14 +328,18 @@ export default defineNuxtPlugin((nuxtApp) => {
     },
     updated(element, binding) {
       const state = ensureLazySrcState(element)
-      const nextSrc = normalizeLazySrc(binding?.value)
-      if (nextSrc === state.src && (state.loadedSrc === nextSrc || !readImageSrc(element))) {
+      const { src: nextSrc, eager } = normalizeLazyBinding(binding?.value)
+      if (
+        nextSrc === state.src
+        && eager === state.eager
+        && (state.loadedSrc === nextSrc || !readImageSrc(element))
+      ) {
         return
       }
       updateLazySrc(element, binding, 'updated')
     },
     beforeUnmount(element) {
-      cleanupLazySrcObserver(element)
+      releaseLazySrc(element)
       delete element.__chatLazySrcState
     }
   })

@@ -6,10 +6,17 @@ import {
   getVoiceDurationInSeconds,
   getVoiceWidth
 } from '~/lib/chat/formatters'
-import { createPerfTrace } from '~/lib/chat/perf-logger'
+import { createPerfTrace, isChatPerfLoggingEnabled, logPerfChannel } from '~/lib/chat/perf-logger'
+import {
+  buildImageGroupKey,
+  deriveImageGroupMessages,
+  findImageGroupKeyByMessageId
+} from '~/lib/chat/image-groups'
 import { createMessageNormalizer, dedupeMessagesById } from '~/lib/chat/message-normalizer'
 
 const DEFAULT_CHAT_SOURCE = 'auto'
+const IMAGE_GROUP_LAYOUT_DURATION_MS = 250
+const IMAGE_GROUP_LAYOUT_EASING = 'cubic-bezier(0.2, 0, 0, 1)'
 
 export const useChatMessages = ({
   api,
@@ -32,6 +39,35 @@ export const useChatMessages = ({
   const showJumpToBottom = ref(false)
   let lastRenderMessagesFingerprint = ''
   let messageLoadSeq = 0
+  let messageLoadController = null
+  let messageLoadTargetUsername = ''
+  let realtimeRefreshController = null
+  let realtimeRefreshTargetUsername = ''
+
+  const isAbortError = (error, controller = null) => {
+    return !!(
+      controller?.signal?.aborted
+      || error?.name === 'AbortError'
+      || error?.cause?.name === 'AbortError'
+      || error?.message === 'This operation was aborted'
+    )
+  }
+
+  const abortMessageLoad = () => {
+    const controller = messageLoadController
+    messageLoadController = null
+    messageLoadTargetUsername = ''
+    if (!controller || controller.signal.aborted) return
+    try { controller.abort() } catch {}
+  }
+
+  const abortRealtimeRefresh = () => {
+    const controller = realtimeRefreshController
+    realtimeRefreshController = null
+    realtimeRefreshTargetUsername = ''
+    if (!controller || controller.signal.aborted) return
+    try { controller.abort() } catch {}
+  }
 
   const isDesktopRenderer = () => {
     if (!process.client || typeof window === 'undefined') return false
@@ -45,14 +81,7 @@ export const useChatMessages = ({
       activeMessagesFor: String(activeMessagesFor.value || '').trim(),
       ...details
     }
-
-    if (isDesktopRenderer()) {
-      try {
-        window.wechatDesktop?.logDebug?.('chat-messages', phase, payload)
-      } catch {}
-    }
-
-    console.info(`[chat-messages] ${phase}`, payload)
+    logPerfChannel('chat-messages', phase, payload)
   }
 
   const summarizeRenderTypes = (list) => {
@@ -87,7 +116,14 @@ export const useChatMessages = ({
 
   const highlightServerIdStr = ref('')
   const highlightMessageId = ref('')
+  const expandedImageGroupKeys = ref(new Set())
+  const imageGroupActiveItemIds = ref(new Map())
+  const activeImageGroupTransitionKey = ref('')
+  const imageGroupTransitioning = ref(false)
   let highlightTimer = null
+  let activeImageGroupAnimations = []
+  let activeImageGroupMotionCleanups = []
+  let imageGroupTransitionSequence = 0
 
   const messageTypeFilter = ref('all')
   const localMediaVersion = ref(0)
@@ -267,24 +303,39 @@ export const useChatMessages = ({
   const renderMessages = computed(() => {
     const list = messages.value || []
     const reverseSides = !!reverseMessageSides.value
-    const fingerprint = `${String(selectedContact.value?.username || '').trim()}:${list.length}:${reverseSides ? '1' : '0'}`
-    const shouldLogRender = isDesktopRenderer() && fingerprint !== lastRenderMessagesFingerprint
+    const expansionFingerprint = Array.from(expandedImageGroupKeys.value).sort().join('|')
+    const fingerprint = `${String(selectedContact.value?.username || '').trim()}:${list.length}:${reverseSides ? '1' : '0'}:${expansionFingerprint}`
+    const shouldLogRender = isDesktopRenderer()
+      && isChatPerfLoggingEnabled()
+      && fingerprint !== lastRenderMessagesFingerprint
     if (shouldLogRender) {
       logMessagePhase('renderMessages:start', {
         count: list.length,
         reverseSides
       })
     }
+    const displayMessages = deriveImageGroupMessages(list, expandedImageGroupKeys.value)
     let previousTs = 0
-    const rendered = list.map((message) => {
+    const rendered = displayMessages.map((message) => {
       const ts = Number(message.createTime || 0)
       const show = !previousTs || (ts && Math.abs(ts - previousTs) >= 300)
       if (ts) previousTs = ts
       const originalIsSent = !!message?.isSent
+      const imageGroupItems = Array.isArray(message?.imageGroupItems)
+        ? message.imageGroupItems.map((item) => {
+            const itemOriginalIsSent = !!item?.isSent
+            return {
+              ...item,
+              _originalIsSent: itemOriginalIsSent,
+              isSent: reverseSides ? !itemOriginalIsSent : itemOriginalIsSent
+            }
+          })
+        : null
       return {
         ...message,
         _originalIsSent: originalIsSent,
         isSent: reverseSides ? !originalIsSent : originalIsSent,
+        ...(imageGroupItems ? { imageGroupItems } : {}),
         showTimeDivider: !!show,
         timeDivider: formatTimeDivider(ts)
       }
@@ -326,12 +377,358 @@ export const useChatMessages = ({
     }, 2200)
   }
 
+  const toggleImageGroupExpanded = (groupKey, forceExpanded = null) => {
+    const key = String(groupKey || '').trim()
+    if (!key) return false
+    const next = new Set(expandedImageGroupKeys.value)
+    const shouldExpand = typeof forceExpanded === 'boolean' ? forceExpanded : !next.has(key)
+    if (shouldExpand) next.add(key)
+    else next.delete(key)
+    expandedImageGroupKeys.value = next
+    return shouldExpand
+  }
+
+  const getImageGroupActiveItemId = (groupKey) => (
+    imageGroupActiveItemIds.value.get(String(groupKey || '').trim()) || ''
+  )
+
+  const setImageGroupActiveItemId = (groupKey, messageId) => {
+    const key = String(groupKey || '').trim()
+    const id = String(messageId || '').trim()
+    if (!key || !id || imageGroupActiveItemIds.value.get(key) === id) return false
+    const next = new Map(imageGroupActiveItemIds.value)
+    next.set(key, id)
+    imageGroupActiveItemIds.value = next
+    return true
+  }
+
+  const captureImageGroupActiveItem = (groupKey) => {
+    const container = messageContainerRef.value
+    const key = String(groupKey || '').trim()
+    if (!container || !key) return ''
+    const stack = Array.from(
+      container.querySelectorAll?.('[data-testid="image-group-stack"][data-group-key]') || []
+    ).find((element) => String(element?.dataset?.groupKey || '') === key)
+    const activeIndex = Number.parseInt(String(stack?.dataset?.activeIndex || ''), 10)
+    const activeCard = Number.isSafeInteger(activeIndex)
+      ? Array.from(stack?.querySelectorAll?.('[data-card-index]') || []).find(
+          (element) => Number.parseInt(String(element?.dataset?.cardIndex || ''), 10) === activeIndex
+        )
+      : null
+    const messageId = String(activeCard?.dataset?.messageId || '').trim()
+    if (messageId) setImageGroupActiveItemId(key, messageId)
+    return messageId
+  }
+
+  const findMessageElementById = (container, messageId) => {
+    const target = String(messageId || '').trim()
+    if (!container || !target) return null
+    return Array.from(container.querySelectorAll?.('[data-msg-id]') || []).find(
+      (element) => String(element?.dataset?.msgId || '').trim() === target
+    ) || null
+  }
+
+  const captureImageGroupScrollAnchor = (groupKey) => {
+    const container = messageContainerRef.value
+    if (!container) return null
+    const first = (messages.value || []).find((message) => buildImageGroupKey(message) === groupKey)
+    const messageId = String(first?.id || '').trim()
+    const element = findMessageElementById(container, messageId)
+    if (!element) return null
+    return {
+      container,
+      messageId,
+      top: element.getBoundingClientRect().top
+    }
+  }
+
+  const restoreImageGroupScrollAnchor = (anchor) => {
+    if (!anchor?.container?.isConnected) return
+    const element = findMessageElementById(anchor.container, anchor.messageId)
+    if (!element) return
+    const delta = element.getBoundingClientRect().top - Number(anchor.top || 0)
+    if (Number.isFinite(delta) && Math.abs(delta) >= 0.5) {
+      anchor.container.scrollTop += delta
+    }
+    updateJumpToBottomState()
+  }
+
+  const readImageGroupElementPose = (element) => {
+    if (!element?.isConnected || typeof window === 'undefined') return null
+    const rect = element.getBoundingClientRect()
+    const style = window.getComputedStyle(element)
+    let scaleX = 1
+    let scaleY = 1
+    let rotation = 0
+    if (style.transform && style.transform !== 'none' && typeof DOMMatrixReadOnly === 'function') {
+      try {
+        const matrix = new DOMMatrixReadOnly(style.transform)
+        scaleX = Math.max(0.001, Math.hypot(matrix.a, matrix.b))
+        scaleY = Math.max(0.001, Math.hypot(matrix.c, matrix.d))
+        rotation = Math.atan2(matrix.b, matrix.a) * (180 / Math.PI)
+      } catch {}
+    }
+    const layoutWidth = Math.max(1, Number(element.offsetWidth || rect.width || 1))
+    const layoutHeight = Math.max(1, Number(element.offsetHeight || rect.height || 1))
+    return {
+      centerX: rect.left + (rect.width / 2),
+      centerY: rect.top + (rect.height / 2),
+      width: layoutWidth * scaleX,
+      height: layoutHeight * scaleY,
+      rotation,
+      opacity: Math.max(0, Math.min(1, Number.parseFloat(style.opacity) || 0)),
+      zIndex: Number.parseInt(style.zIndex, 10) || 0
+    }
+  }
+
+  const captureImageGroupLayout = (groupKey) => {
+    const container = messageContainerRef.value
+    const key = String(groupKey || '').trim()
+    const cards = new Map()
+    if (!container || !key) return { cards, control: null }
+
+    for (const element of container.querySelectorAll?.('[data-image-group-key][data-image-group-item-index]') || []) {
+      if (String(element?.dataset?.imageGroupKey || '') !== key) continue
+      const index = Number.parseInt(String(element?.dataset?.imageGroupItemIndex || ''), 10)
+      const pose = readImageGroupElementPose(element)
+      if (!Number.isSafeInteger(index) || index < 0 || !pose) continue
+      cards.set(index, { element, pose })
+    }
+
+    const controlElement = Array.from(
+      container.querySelectorAll?.('[data-image-group-control-key]') || []
+    ).find((element) => String(element?.dataset?.imageGroupControlKey || '') === key)
+    const controlPose = readImageGroupElementPose(controlElement)
+    return {
+      cards,
+      control: controlElement && controlPose ? { element: controlElement, pose: controlPose } : null
+    }
+  }
+
+  const readImageGroupMotionTarget = (element) => {
+    if (!element?.isConnected || typeof window === 'undefined') return null
+    const previousTransition = element.style.transition
+    const previousTransform = element.style.transform
+    const previousTransformOrigin = element.style.transformOrigin
+    const previousWillChange = element.style.willChange
+    const previousPosition = element.style.position
+    const previousZIndex = element.style.zIndex
+    const finalStyle = window.getComputedStyle(element)
+    const finalTransform = previousTransform || (
+      finalStyle.transform && finalStyle.transform !== 'none' ? finalStyle.transform : 'none'
+    )
+    const finalOpacity = Math.max(0, Math.min(1, Number.parseFloat(finalStyle.opacity) || 0))
+
+    element.style.transition = 'none'
+    element.style.transform = 'none'
+    const baseRect = element.getBoundingClientRect()
+    element.style.transform = previousTransform
+    element.style.transition = previousTransition
+
+    return {
+      baseRect,
+      finalTransform,
+      finalOpacity,
+      restore: () => {
+        element.style.transition = previousTransition
+        element.style.transform = previousTransform
+        element.style.transformOrigin = previousTransformOrigin
+        element.style.willChange = previousWillChange
+        element.style.position = previousPosition
+        element.style.zIndex = previousZIndex
+      }
+    }
+  }
+
+  const buildImageGroupStartTransform = (sourcePose, baseRect) => {
+    const baseWidth = Math.max(1, Number(baseRect?.width || 1))
+    const baseHeight = Math.max(1, Number(baseRect?.height || 1))
+    const baseCenterX = Number(baseRect?.left || 0) + (baseWidth / 2)
+    const baseCenterY = Number(baseRect?.top || 0) + (baseHeight / 2)
+    const translateX = Number(sourcePose?.centerX || 0) - baseCenterX
+    const translateY = Number(sourcePose?.centerY || 0) - baseCenterY
+    const scaleX = Math.max(0.001, Number(sourcePose?.width || 1) / baseWidth)
+    const scaleY = Math.max(0.001, Number(sourcePose?.height || 1) / baseHeight)
+    const rotation = Number(sourcePose?.rotation || 0)
+    return `translate3d(${translateX}px, ${translateY}px, 0) rotate(${rotation}deg) scale(${scaleX}, ${scaleY})`
+  }
+
+  const registerImageGroupMotionCleanup = (cleanup) => {
+    if (typeof cleanup === 'function') activeImageGroupMotionCleanups.push(cleanup)
+  }
+
+  const animateImageGroupMotionElement = (element, sourcePose, { fadeLabel = false } = {}) => {
+    const target = readImageGroupMotionTarget(element)
+    if (!target || typeof element.animate !== 'function') return null
+
+    element.style.transformOrigin = '50% 50%'
+    element.style.willChange = 'transform, opacity'
+    if (!element.closest?.('[data-testid="image-group-stack"]')) {
+      element.style.position = 'relative'
+      element.style.zIndex = String(100 + Number(sourcePose?.zIndex || 0))
+    }
+    registerImageGroupMotionCleanup(target.restore)
+
+    return element.animate([
+      {
+        transform: buildImageGroupStartTransform(sourcePose, target.baseRect),
+        opacity: fadeLabel ? 0.25 : Number(sourcePose?.opacity ?? 1)
+      },
+      {
+        transform: target.finalTransform,
+        opacity: target.finalOpacity
+      }
+    ], {
+      duration: IMAGE_GROUP_LAYOUT_DURATION_MS,
+      easing: IMAGE_GROUP_LAYOUT_EASING,
+      fill: 'both'
+    })
+  }
+
+  const clearActiveImageGroupMotion = () => {
+    const animations = activeImageGroupAnimations
+    const cleanups = activeImageGroupMotionCleanups
+    activeImageGroupAnimations = []
+    activeImageGroupMotionCleanups = []
+    for (const animation of animations) {
+      try { animation.cancel() } catch {}
+    }
+    for (const cleanup of cleanups.reverse()) {
+      try { cleanup() } catch {}
+    }
+  }
+
+  const animateImageGroupLayout = async (sourceLayout, groupKey) => {
+    const targetLayout = captureImageGroupLayout(groupKey)
+    const animations = []
+
+    for (const [index, source] of sourceLayout?.cards || []) {
+      const target = targetLayout.cards.get(index)
+      if (!target) continue
+      const animation = animateImageGroupMotionElement(target.element, source.pose)
+      if (animation) animations.push(animation)
+    }
+
+    if (sourceLayout?.control && targetLayout.control) {
+      const animation = animateImageGroupMotionElement(
+        targetLayout.control.element,
+        sourceLayout.control.pose,
+        { fadeLabel: true }
+      )
+      if (animation) animations.push(animation)
+    }
+
+    activeImageGroupAnimations = animations
+    await Promise.allSettled(animations.map((animation) => animation.finished))
+  }
+
+  const clearImageGroupTransitionState = (sequence = null) => {
+    if (sequence != null && sequence !== imageGroupTransitionSequence) return
+    clearActiveImageGroupMotion()
+    activeImageGroupTransitionKey.value = ''
+    imageGroupTransitioning.value = false
+    if (typeof document !== 'undefined') {
+      delete document.documentElement.dataset.imageGroupTransition
+      delete document.documentElement.dataset.imageGroupTransitionKey
+    }
+  }
+
+  const cancelImageGroupTransition = () => {
+    imageGroupTransitionSequence += 1
+    clearImageGroupTransitionState()
+  }
+
+  const shouldReduceImageGroupMotion = () => (
+    typeof window !== 'undefined'
+    && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  )
+
+  const transitionImageGroupExpanded = async (groupKey, forceExpanded = null) => {
+    const key = String(groupKey || '').trim()
+    if (!key) return false
+
+    const currentlyExpanded = expandedImageGroupKeys.value.has(key)
+    const shouldExpand = typeof forceExpanded === 'boolean' ? forceExpanded : !currentlyExpanded
+    if (shouldExpand === currentlyExpanded) return currentlyExpanded
+    if (imageGroupTransitioning.value) return currentlyExpanded
+
+    const canAnimate = (
+      typeof document !== 'undefined'
+      && document.visibilityState === 'visible'
+      && typeof Element !== 'undefined'
+      && typeof Element.prototype?.animate === 'function'
+      && !shouldReduceImageGroupMotion()
+    )
+    if (!canAnimate) {
+      if (shouldExpand) captureImageGroupActiveItem(key)
+      return toggleImageGroupExpanded(key, shouldExpand)
+    }
+
+    const sequence = ++imageGroupTransitionSequence
+    const direction = shouldExpand ? 'expand' : 'collapse'
+    let committed = false
+
+    imageGroupTransitioning.value = true
+    activeImageGroupTransitionKey.value = key
+    document.documentElement.dataset.imageGroupTransition = direction
+    document.documentElement.dataset.imageGroupTransitionKey = key
+    await nextTick()
+    if (sequence !== imageGroupTransitionSequence) return currentlyExpanded
+    if (shouldExpand) captureImageGroupActiveItem(key)
+    const anchor = captureImageGroupScrollAnchor(key)
+    const sourceLayout = captureImageGroupLayout(key)
+
+    try {
+      committed = true
+      toggleImageGroupExpanded(key, shouldExpand)
+      await nextTick()
+      if (sequence !== imageGroupTransitionSequence) return shouldExpand
+      restoreImageGroupScrollAnchor(anchor)
+      await animateImageGroupLayout(sourceLayout, key)
+    } catch {
+      if (!committed && sequence === imageGroupTransitionSequence) {
+        committed = true
+        toggleImageGroupExpanded(key, shouldExpand)
+        await nextTick()
+        restoreImageGroupScrollAnchor(anchor)
+      }
+    } finally {
+      if (!committed && sequence === imageGroupTransitionSequence) {
+        toggleImageGroupExpanded(key, shouldExpand)
+        await nextTick()
+        restoreImageGroupScrollAnchor(anchor)
+      }
+      clearImageGroupTransitionState(sequence)
+      await nextTick()
+    }
+
+    return shouldExpand
+  }
+
+  const clearExpandedImageGroups = () => {
+    cancelImageGroupTransition()
+    if (expandedImageGroupKeys.value.size) expandedImageGroupKeys.value = new Set()
+    if (imageGroupActiveItemIds.value.size) imageGroupActiveItemIds.value = new Map()
+  }
+
   const scrollToMessageId = async (id) => {
     const target = String(id || '').trim()
     if (!target) return false
+    const groupKey = findImageGroupKeyByMessageId(messages.value, target)
+    if (groupKey && !expandedImageGroupKeys.value.has(groupKey)) {
+      toggleImageGroupExpanded(groupKey, true)
+    }
     await nextTick()
     const container = messageContainerRef.value
-    const element = container?.querySelector?.(`[data-msg-id="${CSS.escape(target)}"]`)
+    let element = container?.querySelector?.(`[data-msg-id="${CSS.escape(target)}"]`)
+    if (!element) {
+      if (groupKey) {
+        toggleImageGroupExpanded(groupKey, true)
+        await nextTick()
+        element = container?.querySelector?.(`[data-msg-id="${CSS.escape(target)}"]`)
+      }
+    }
     if (!element || typeof element.scrollIntoView !== 'function') return false
     element.scrollIntoView({ block: 'center', behavior: 'smooth' })
     return true
@@ -990,6 +1387,10 @@ export const useChatMessages = ({
   const loadMessages = async ({ username, reset }) => {
     if (!username || !selectedAccount.value) return
 
+    abortMessageLoad()
+    const requestController = typeof AbortController === 'function' ? new AbortController() : null
+    messageLoadController = requestController
+    messageLoadTargetUsername = String(username || '').trim()
     const loadSeq = ++messageLoadSeq
     const accountAtStart = String(selectedAccount.value || '').trim()
     const filterAtStart = String(messageTypeFilter.value || 'all').trim() || 'all'
@@ -1052,6 +1453,7 @@ export const useChatMessages = ({
           params.scan_limit = messageTypeFilterScanPageSize
         }
         params.source = DEFAULT_CHAT_SOURCE
+        if (requestController) params.signal = requestController.signal
         trace.log('loadMessages:request:start', {
           requestIndex,
           offset: requestOffset,
@@ -1199,6 +1601,10 @@ export const useChatMessages = ({
         message: String(error?.message || ''),
         errorName: String(error?.name || '')
       })
+      if (isAbortError(error, requestController)) {
+        trace.log('loadMessages:request:aborted')
+        return
+      }
       console.error('[chat-messages] loadMessages:error', {
         account: String(selectedAccount.value || '').trim(),
         username: String(username || '').trim(),
@@ -1209,6 +1615,10 @@ export const useChatMessages = ({
         messagesError.value = error?.message || '加载聊天记录失败'
       }
     } finally {
+      if (messageLoadController === requestController) {
+        messageLoadController = null
+        messageLoadTargetUsername = ''
+      }
       if (loadSeq === messageLoadSeq) {
         isLoadingMessages.value = false
       }
@@ -1277,6 +1687,11 @@ export const useChatMessages = ({
       params.render_types = messageTypeFilter.value
     }
 
+    abortRealtimeRefresh()
+    const requestController = typeof AbortController === 'function' ? new AbortController() : null
+    realtimeRefreshController = requestController
+    realtimeRefreshTargetUsername = String(username || '').trim()
+    if (requestController) params.signal = requestController.signal
     try {
       const response = await api.listChatMessages(params)
       if (selectedContact.value?.username !== username) return
@@ -1304,11 +1719,17 @@ export const useChatMessages = ({
       }
       updateJumpToBottomState()
     } catch (error) {
+      if (isAbortError(error, requestController)) return
       console.error('[chat-messages] refreshRealtimeIncremental:error', {
         account: String(selectedAccount.value || '').trim(),
         username: String(username || '').trim(),
         error
       })
+    } finally {
+      if (realtimeRefreshController === requestController) {
+        realtimeRefreshController = null
+        realtimeRefreshTargetUsername = ''
+      }
     }
   }
 
@@ -1341,12 +1762,15 @@ export const useChatMessages = ({
   }
 
   const resetMessageState = () => {
+    abortMessageLoad()
+    abortRealtimeRefresh()
     clearVoicePlaybackState()
     allMessages.value = {}
     messagesMeta.value = {}
     messagesError.value = ''
     highlightMessageId.value = ''
     highlightServerIdStr.value = ''
+    clearExpandedImageGroups()
     closeImagePreview()
     closeVideoPreview()
     resetResourceState()
@@ -1357,18 +1781,59 @@ export const useChatMessages = ({
   const contactProfileCardMessageId = ref('')
   const contactProfileLoading = ref(false)
   const contactProfileVerificationLoading = ref(false)
+  const contactProfileVerificationLoaded = ref(false)
+  const contactProfileVerificationError = ref('')
   const contactProfileError = ref('')
   const contactProfileData = ref(null)
   const CONTACT_PROFILE_REQUEST_TIMEOUT_MS = 4500
+  const CONTACT_PROFILE_HOVER_INTENT_MS = 250
+  const CONTACT_PROFILE_CACHE_TTL_MS = 5 * 60 * 1000
+  const CONTACT_VERIFICATION_CACHE_TTL_MS = 5 * 60 * 1000
+  const CONTACT_PROFILE_CACHE_MAX_ENTRIES = 128
+  const contactProfileCache = new Map()
+  const contactProfileInflight = new Map()
+  const contactVerificationCache = new Map()
+  const contactVerificationInflight = new Map()
   let contactProfileFetchSeq = 0
+  let contactProfileHoverIntentTimer = null
   let contactProfileHoverHideTimer = null
+  let activeContactProfileRequest = null
+  let activeContactVerificationRequest = null
 
-  const withContactProfileTimeout = (promise, ms, message = '请求超时') => {
+  const makeContactProfileCacheKey = (account, username) => (
+    `${String(account || '').trim()}\u0000${String(username || '').trim()}`
+  )
+
+  const readTimedCache = (cache, key, ttlMs) => {
+    const entry = cache.get(key)
+    if (!entry) return null
+    if ((Date.now() - Number(entry.updatedAt || 0)) > ttlMs) {
+      cache.delete(key)
+      return null
+    }
+    return entry
+  }
+
+  const writeTimedCache = (cache, key, data) => {
+    cache.delete(key)
+    cache.set(key, { updatedAt: Date.now(), data })
+    while (cache.size > CONTACT_PROFILE_CACHE_MAX_ENTRIES) {
+      const oldestKey = cache.keys().next().value
+      if (oldestKey == null) break
+      cache.delete(oldestKey)
+    }
+  }
+
+  const withContactProfileTimeout = (promise, ms, message = '请求超时', controller = null) => {
     let timer = null
     return new Promise((resolve, reject) => {
       timer = setTimeout(() => {
+        timer = null
         const error = new Error(message)
         error.code = 'ETIMEDOUT'
+        if (controller && !controller.signal.aborted) {
+          try { controller.abort() } catch {}
+        }
         reject(error)
       }, Math.max(1, Number(ms || 0)))
 
@@ -1385,6 +1850,121 @@ export const useChatMessages = ({
         }
       )
     })
+  }
+
+  const abortInflightRequest = (entry, inflight) => {
+    if (!entry) return
+    if (inflight.get(entry.key) === entry) inflight.delete(entry.key)
+    if (entry.controller && !entry.controller.signal.aborted) {
+      try { entry.controller.abort() } catch {}
+    }
+  }
+
+  const abortActiveContactProfileRequest = () => {
+    const entry = activeContactProfileRequest
+    activeContactProfileRequest = null
+    abortInflightRequest(entry, contactProfileInflight)
+  }
+
+  const abortActiveContactVerificationRequest = () => {
+    const entry = activeContactVerificationRequest
+    activeContactVerificationRequest = null
+    abortInflightRequest(entry, contactVerificationInflight)
+  }
+
+  const abortContactRequestsExcept = (key) => {
+    if (activeContactProfileRequest?.key && activeContactProfileRequest.key !== key) {
+      abortActiveContactProfileRequest()
+    }
+    if (activeContactVerificationRequest?.key && activeContactVerificationRequest.key !== key) {
+      abortActiveContactVerificationRequest()
+    }
+  }
+
+  const requestContactProfile = ({ account, username }) => {
+    const key = makeContactProfileCacheKey(account, username)
+    const cached = readTimedCache(contactProfileCache, key, CONTACT_PROFILE_CACHE_TTL_MS)
+    if (cached) return Promise.resolve(cached.data)
+
+    const pending = contactProfileInflight.get(key)
+    if (pending) {
+      activeContactProfileRequest = pending
+      return pending.promise
+    }
+
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const params = {
+      account,
+      source: DEFAULT_CHAT_SOURCE,
+      username
+    }
+    if (controller) params.signal = controller.signal
+
+    const entry = { key, controller, promise: null }
+    entry.promise = withContactProfileTimeout(
+      api.getChatContactProfile(params),
+      CONTACT_PROFILE_REQUEST_TIMEOUT_MS,
+      '联系人资料加载超时',
+      controller
+    ).then((response) => {
+      writeTimedCache(contactProfileCache, key, response)
+      return response
+    }).finally(() => {
+      if (contactProfileInflight.get(key) === entry) contactProfileInflight.delete(key)
+      if (activeContactProfileRequest === entry) activeContactProfileRequest = null
+    })
+    contactProfileInflight.set(key, entry)
+    activeContactProfileRequest = entry
+    return entry.promise
+  }
+
+  const requestContactFriendVerifications = ({ account, username }) => {
+    const key = makeContactProfileCacheKey(account, username)
+    const cached = readTimedCache(contactVerificationCache, key, CONTACT_VERIFICATION_CACHE_TTL_MS)
+    if (cached) return Promise.resolve(cached.data)
+
+    const pending = contactVerificationInflight.get(key)
+    if (pending) {
+      activeContactVerificationRequest = pending
+      return pending.promise
+    }
+
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const params = {
+      account,
+      q: username,
+      source: 'realtime',
+      limit: 200,
+      offset: 0
+    }
+    if (controller) params.signal = controller.signal
+
+    const entry = { key, controller, promise: null }
+    entry.promise = withContactProfileTimeout(
+      api.listFriendVerifications(params),
+      CONTACT_PROFILE_REQUEST_TIMEOUT_MS,
+      '好友验证记录加载超时',
+      controller
+    ).then((response) => {
+      const records = (Array.isArray(response?.items) ? response.items : [])
+        .filter((item) => String(item?.userName || '').trim() === username)
+        .map((item) => ({
+          userName: username,
+          isSender: !!item?.isSender,
+          content: String(item?.content || '').trim(),
+          remark: String(item?.remark || '').trim(),
+          timeText: String(item?.timeText || '').trim(),
+          timestamp: Number(item?.timestamp || 0)
+        }))
+      writeTimedCache(contactVerificationCache, key, records)
+      return records
+    }).finally(() => {
+      if (contactVerificationInflight.get(key) === entry) contactVerificationInflight.delete(key)
+      if (activeContactVerificationRequest === entry) activeContactVerificationRequest = null
+    })
+    contactVerificationInflight.set(key, entry)
+    activeContactVerificationRequest = entry
+    return entry.promise
   }
 
   const contactProfileInitialLoading = computed(() => (
@@ -1499,42 +2079,44 @@ export const useChatMessages = ({
     return Number.isFinite(scene) ? scene : null
   })
 
-  const loadContactFriendVerifications = async ({ seq, account, username }) => {
+  const applyCachedContactVerifications = (profile, account, username) => {
+    const key = makeContactProfileCacheKey(account, username)
+    const cached = readTimedCache(contactVerificationCache, key, CONTACT_VERIFICATION_CACHE_TTL_MS)
+    contactProfileVerificationLoaded.value = !!cached
+    contactProfileVerificationError.value = ''
+    return {
+      ...profile,
+      friendVerifications: cached ? cached.data : []
+    }
+  }
+
+  const loadContactFriendVerifications = async () => {
+    const seq = contactProfileFetchSeq
+    const account = String(selectedAccount.value || '').trim()
+    const username = String(contactProfileData.value?.username || '').trim()
+    if (!account || !username || !contactProfileIsFriend.value) return
+
+    const key = makeContactProfileCacheKey(account, username)
+    abortContactRequestsExcept(key)
     contactProfileVerificationLoading.value = true
+    contactProfileVerificationError.value = ''
     try {
-      const response = await withContactProfileTimeout(
-        api.listFriendVerifications({
-          account,
-          q: username,
-          source: 'realtime',
-          limit: 200,
-          offset: 0
-        }),
-        CONTACT_PROFILE_REQUEST_TIMEOUT_MS,
-        '好友验证记录加载超时'
-      )
-      if (seq !== contactProfileFetchSeq) return
-      const records = (Array.isArray(response?.items) ? response.items : [])
-        .filter((item) => String(item?.userName || '').trim() === username)
-        .map((item) => ({
-          userName: username,
-          isSender: !!item?.isSender,
-          content: String(item?.content || '').trim(),
-          remark: String(item?.remark || '').trim(),
-          timeText: String(item?.timeText || '').trim(),
-          timestamp: Number(item?.timestamp || 0)
-        }))
+      const records = await requestContactFriendVerifications({ account, username })
+      if (
+        seq !== contactProfileFetchSeq
+        || String(contactProfileData.value?.username || '').trim() !== username
+      ) return
       contactProfileData.value = {
         ...(contactProfileData.value || {}),
         friendVerifications: records
       }
-    } catch {
-      if (seq === contactProfileFetchSeq) {
-        contactProfileData.value = {
-          ...(contactProfileData.value || {}),
-          friendVerifications: []
-        }
-      }
+      contactProfileVerificationLoaded.value = true
+    } catch (error) {
+      if (seq !== contactProfileFetchSeq || isAbortError(error)) return
+      contactProfileVerificationLoaded.value = false
+      contactProfileVerificationError.value = error?.code === 'ETIMEDOUT'
+        ? '加载超时，请重试'
+        : (error?.message || '好友验证记录加载失败')
     } finally {
       if (seq === contactProfileFetchSeq) contactProfileVerificationLoading.value = false
     }
@@ -1551,6 +2133,8 @@ export const useChatMessages = ({
       contactProfileLoading.value = false
       return
     }
+    const key = makeContactProfileCacheKey(account, username)
+    abortContactRequestsExcept(key)
 
     const contextPatch = {
       groupNickname: String(options?.groupNickname || contactProfileData.value?.groupNickname || '').trim(),
@@ -1560,15 +2144,7 @@ export const useChatMessages = ({
     contactProfileLoading.value = true
     contactProfileError.value = ''
     try {
-      const response = await withContactProfileTimeout(
-        api.getChatContactProfile({
-          account,
-          source: DEFAULT_CHAT_SOURCE,
-          username
-        }),
-        CONTACT_PROFILE_REQUEST_TIMEOUT_MS,
-        '联系人资料加载超时'
-      )
+      const response = await requestContactProfile({ account, username })
       if (seq !== contactProfileFetchSeq) return
       const matched = response?.contact && typeof response.contact === 'object' ? response.contact : null
       if (matched) {
@@ -1579,12 +2155,12 @@ export const useChatMessages = ({
         if (!String(normalized.avatar || '').trim() && avatarFallback) {
           normalized.avatar = avatarFallback
         }
-        contactProfileData.value = { ...normalized, friendVerifications: [] }
+        contactProfileData.value = applyCachedContactVerifications(normalized, account, username)
       } else {
         const fallbackType = username.endsWith('@chatroom')
           ? 'group'
           : (username.startsWith('gh_') ? 'official' : 'friend')
-        contactProfileData.value = {
+        contactProfileData.value = applyCachedContactVerifications({
           username,
           type: fallbackType,
           displayName: displayNameFallback || selectedContact.value?.name || username,
@@ -1602,16 +2178,13 @@ export const useChatMessages = ({
           addTimeText: '',
           commonChatroomCount: null,
           commonChatrooms: [],
-          friendVerifications: [],
           ...contextPatch
-        }
-      }
-      if (contactProfileIsFriend.value) {
-        await loadContactFriendVerifications({ seq, account, username })
+        }, account, username)
       }
     } catch (error) {
       if (seq !== contactProfileFetchSeq) return
-      contactProfileData.value = {
+      if (isAbortError(error)) return
+      contactProfileData.value = applyCachedContactVerifications({
         username,
         type: username.endsWith('@chatroom') ? 'group' : (username.startsWith('gh_') ? 'official' : 'friend'),
         displayName: displayNameFallback || selectedContact.value?.name || username,
@@ -1629,12 +2202,18 @@ export const useChatMessages = ({
         addTimeText: '',
         commonChatroomCount: null,
         commonChatrooms: [],
-        friendVerifications: [],
         ...contextPatch
-      }
+      }, account, username)
       contactProfileError.value = error?.code === 'ETIMEDOUT' ? '' : (error?.message || '加载联系人资料失败')
     } finally {
       if (seq === contactProfileFetchSeq) contactProfileLoading.value = false
+    }
+  }
+
+  const clearContactProfileHoverIntentTimer = () => {
+    if (contactProfileHoverIntentTimer) {
+      clearTimeout(contactProfileHoverIntentTimer)
+      contactProfileHoverIntentTimer = null
     }
   }
 
@@ -1646,11 +2225,80 @@ export const useChatMessages = ({
   }
 
   const closeContactProfileCard = () => {
+    clearContactProfileHoverIntentTimer()
+    clearContactProfileHoverHideTimer()
     contactProfileFetchSeq++
+    abortActiveContactProfileRequest()
+    abortActiveContactVerificationRequest()
     contactProfileLoading.value = false
     contactProfileVerificationLoading.value = false
+    contactProfileVerificationLoaded.value = false
+    contactProfileVerificationError.value = ''
     contactProfileCardOpen.value = false
     contactProfileCardMessageId.value = ''
+  }
+
+  const applyContactProfilePreview = (options = {}) => {
+    const username = String(options?.username || '').trim()
+    const account = String(selectedAccount.value || '').trim()
+    if (!username || !account) return
+    const displayName = String(options?.displayName || username).trim() || username
+    const avatar = String(options?.avatar || '').trim()
+    const avatarColor = String(options?.avatarColor || '').trim()
+    const groupNickname = String(options?.groupNickname || '').trim()
+    const currentUsername = String(contactProfileData.value?.username || '').trim()
+
+    if (currentUsername !== username) {
+      contactProfileData.value = applyCachedContactVerifications({
+        username,
+        type: username.endsWith('@chatroom') ? 'group' : (username.startsWith('gh_') ? 'official' : 'friend'),
+        displayName,
+        avatar,
+        avatarColor,
+        nickname: '',
+        alias: '',
+        gender: null,
+        region: '',
+        remark: '',
+        signature: '',
+        source: '',
+        sourceScene: null,
+        addTime: null,
+        addTimeText: '',
+        commonChatroomCount: null,
+        commonChatrooms: [],
+        groupNickname
+      }, account, username)
+      return
+    }
+
+    contactProfileData.value = applyCachedContactVerifications({
+      ...(contactProfileData.value || {}),
+      displayName: String(contactProfileData.value?.displayName || '').trim() || displayName,
+      avatar: String(contactProfileData.value?.avatar || '').trim() || avatar,
+      avatarColor: avatarColor || String(contactProfileData.value?.avatarColor || '').trim(),
+      groupNickname
+    }, account, username)
+  }
+
+  const openContactProfileCardAfterIntent = ({ cardId, ...options }) => {
+    const username = String(options?.username || '').trim()
+    const account = String(selectedAccount.value || '').trim()
+    if (!cardId || !username || !account) return
+    abortContactRequestsExcept(makeContactProfileCacheKey(account, username))
+    applyContactProfilePreview({ ...options, username })
+    contactProfileCardMessageId.value = cardId
+    contactProfileCardOpen.value = true
+    void fetchContactProfile({ ...options, username })
+  }
+
+  const scheduleContactProfileCard = (options = {}) => {
+    clearContactProfileHoverIntentTimer()
+    clearContactProfileHoverHideTimer()
+    contactProfileHoverIntentTimer = setTimeout(() => {
+      contactProfileHoverIntentTimer = null
+      openContactProfileCardAfterIntent(options)
+    }, CONTACT_PROFILE_HOVER_INTENT_MS)
   }
 
   const getMentionContactProfileCardId = (message, user) => {
@@ -1666,7 +2314,7 @@ export const useChatMessages = ({
     return String(contactProfileCardMessageId.value || '').startsWith(`mention:${messageId}:`)
   }
 
-  const onMessageAvatarMouseEnter = async (message) => {
+  const onMessageAvatarMouseEnter = (message) => {
     if (!!message?.isSent) return
     const messageId = String(message?.id ?? '').trim()
     if (!messageId) return
@@ -1675,41 +2323,8 @@ export const useChatMessages = ({
 
     const senderName = String(message?.senderDisplayName || message?.sender || '').trim()
     const senderAvatar = String(message?.avatar || '').trim()
-    if (!contactProfileData.value || String(contactProfileData.value?.username || '').trim() !== username) {
-      contactProfileData.value = {
-        username,
-        displayName: senderName || username,
-        avatar: senderAvatar,
-        avatarColor: String(message?.avatarColor || '').trim(),
-        nickname: '',
-        alias: '',
-        gender: null,
-        region: '',
-        remark: '',
-        signature: '',
-        source: '',
-        sourceScene: null,
-        addTime: null,
-        addTimeText: '',
-        commonChatroomCount: null,
-        commonChatrooms: [],
-        groupNickname: message?.isGroup ? senderName : '',
-      }
-    } else {
-      if (!String(contactProfileData.value?.displayName || '').trim() && senderName) {
-        contactProfileData.value.displayName = senderName
-      }
-      if (!String(contactProfileData.value?.avatar || '').trim() && senderAvatar) {
-        contactProfileData.value.avatar = senderAvatar
-      }
-      contactProfileData.value.avatarColor = String(message?.avatarColor || contactProfileData.value?.avatarColor || '').trim()
-      contactProfileData.value.groupNickname = message?.isGroup ? senderName : ''
-    }
-
-    clearContactProfileHoverHideTimer()
-    contactProfileCardMessageId.value = messageId
-    contactProfileCardOpen.value = true
-    await fetchContactProfile({
+    scheduleContactProfileCard({
+      cardId: messageId,
       username,
       displayName: senderName,
       avatar: senderAvatar,
@@ -1718,7 +2333,7 @@ export const useChatMessages = ({
     })
   }
 
-  const onMentionMouseEnter = async (message, user) => {
+  const onMentionMouseEnter = (message, user) => {
     const username = String(user?.username || '').trim()
     if (!username) return
     if (username === 'notify@all') return
@@ -1727,41 +2342,8 @@ export const useChatMessages = ({
 
     const displayName = String(user?.displayName || user?.nickname || user?.remark || username).trim()
     const avatar = String(user?.avatar || '').trim()
-    if (!contactProfileData.value || String(contactProfileData.value?.username || '').trim() !== username) {
-      contactProfileData.value = {
-        username,
-        displayName: displayName || username,
-        avatar,
-        avatarColor: String(user?.avatarColor || '').trim(),
-        nickname: '',
-        alias: '',
-        gender: null,
-        region: '',
-        remark: '',
-        signature: '',
-        source: '',
-        sourceScene: null,
-        addTime: null,
-        addTimeText: '',
-        commonChatroomCount: null,
-        commonChatrooms: [],
-        groupNickname: displayName,
-      }
-    } else {
-      if (!String(contactProfileData.value?.displayName || '').trim() && displayName) {
-        contactProfileData.value.displayName = displayName
-      }
-      if (!String(contactProfileData.value?.avatar || '').trim() && avatar) {
-        contactProfileData.value.avatar = avatar
-      }
-      contactProfileData.value.avatarColor = String(user?.avatarColor || contactProfileData.value?.avatarColor || '').trim()
-      contactProfileData.value.groupNickname = displayName
-    }
-
-    clearContactProfileHoverHideTimer()
-    contactProfileCardMessageId.value = cardId
-    contactProfileCardOpen.value = true
-    await fetchContactProfile({
+    scheduleContactProfileCard({
+      cardId,
       username,
       displayName,
       avatar,
@@ -1771,6 +2353,7 @@ export const useChatMessages = ({
   }
 
   const onMessageAvatarMouseLeave = () => {
+    clearContactProfileHoverIntentTimer()
     clearContactProfileHoverHideTimer()
     contactProfileHoverHideTimer = setTimeout(() => {
       closeContactProfileCard()
@@ -1782,12 +2365,21 @@ export const useChatMessages = ({
   }
 
   const onContactCardMouseEnter = () => {
+    clearContactProfileHoverIntentTimer()
     clearContactProfileHoverHideTimer()
   }
 
   watch(
     () => selectedContact.value?.username,
-    () => {
+    (username) => {
+      const nextUsername = String(username || '').trim()
+      if (messageLoadTargetUsername && messageLoadTargetUsername !== nextUsername) {
+        abortMessageLoad()
+      }
+      if (realtimeRefreshTargetUsername && realtimeRefreshTargetUsername !== nextUsername) {
+        abortRealtimeRefresh()
+      }
+      clearExpandedImageGroups()
       loadLargeImagePreferences()
       clearContactProfileHoverHideTimer()
       closeContactProfileCard()
@@ -1803,6 +2395,7 @@ export const useChatMessages = ({
   watch(
     () => selectedAccount.value,
     () => {
+      clearExpandedImageGroups()
       loadLargeImagePreferences()
       clearContactProfileHoverHideTimer()
       closeContactProfileCard()
@@ -1813,9 +2406,15 @@ export const useChatMessages = ({
   )
 
   onUnmounted(() => {
+    abortMessageLoad()
+    abortRealtimeRefresh()
     if (highlightTimer) clearTimeout(highlightTimer)
     highlightTimer = null
+    cancelImageGroupTransition()
+    clearContactProfileHoverIntentTimer()
     clearContactProfileHoverHideTimer()
+    abortActiveContactProfileRequest()
+    abortActiveContactVerificationRequest()
     clearVoicePlaybackState()
   })
 
@@ -1856,11 +2455,17 @@ export const useChatMessages = ({
     playingVoiceId,
     highlightServerIdStr,
     highlightMessageId,
+    expandedImageGroupKeys,
+    imageGroupActiveItemIds,
+    activeImageGroupTransitionKey,
+    imageGroupTransitioning,
     contactProfileCardOpen,
     contactProfileCardMessageId,
     contactProfileLoading,
     contactProfileInitialLoading,
     contactProfileVerificationLoading,
+    contactProfileVerificationLoaded,
+    contactProfileVerificationError,
     contactProfileError,
     contactProfileData,
     contactProfileResolvedName,
@@ -1888,6 +2493,10 @@ export const useChatMessages = ({
     scrollToBottom,
     flashMessage,
     scrollToMessageId,
+    toggleImageGroupExpanded,
+    transitionImageGroupExpanded,
+    getImageGroupActiveItemId,
+    setImageGroupActiveItemId,
     openImagePreview,
     closeImagePreview,
     showPrevPreviewImage,
@@ -1928,6 +2537,7 @@ export const useChatMessages = ({
     queueRealtimeRefresh,
     resetMessageState,
     fetchContactProfile,
+    loadContactFriendVerifications,
     clearContactProfileHoverHideTimer,
     closeContactProfileCard,
     getMentionContactProfileCardId,

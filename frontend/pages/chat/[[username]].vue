@@ -1,9 +1,9 @@
 <template>
-  <div class="chat-page-shell h-screen flex overflow-hidden">
+  <div class="chat-page-shell h-screen w-full min-w-0 flex overflow-hidden">
     <SessionListPanel :state="chatState" />
 
-    <div class="chat-page-main flex-1 flex flex-col min-h-0">
-      <div class="flex-1 flex min-h-0">
+    <div class="chat-page-main flex-1 flex flex-col min-h-0 min-w-0">
+      <div class="flex-1 flex min-h-0 min-w-0">
         <ConversationPane :state="chatState" />
       </div>
     </div>
@@ -488,17 +488,13 @@ const editingState = useChatEditing({
   api,
   selectedAccount,
   selectedContact,
-  refreshSelectedMessages,
-  normalizeMessage,
-  allMessages,
   locateMessageByServerId
 })
 
 const {
   contextMenu,
   closeContextMenu,
-  closeMessageEditModal,
-  closeMessageFieldsModal
+  closeModifyTextUnavailableDialog
 } = editingState
 
 const {
@@ -520,40 +516,60 @@ const resetAccountScopedState = () => {
   resetMessageState()
   searchState.resetSearchState()
   closeContextMenu()
-  closeMessageEditModal()
-  closeMessageFieldsModal()
+  closeModifyTextUnavailableDialog()
   clearContactProfileHoverHideTimer()
   closeContactProfileCard()
 }
 
+const REALTIME_SESSIONS_REFRESH_MIN_INTERVAL_MS = 3000
+
 let realtimeSessionsRefreshFuture = null
+let realtimeSessionsRefreshTimer = null
 let realtimeSessionsRefreshQueued = false
+let lastRealtimeSessionsRefreshAt = 0
 
-const queueRealtimeSessionsRefresh = () => {
-  if (realtimeSessionsRefreshFuture) {
-    realtimeSessionsRefreshQueued = true
-    return
-  }
+const runRealtimeSessionsRefresh = () => {
+  realtimeSessionsRefreshTimer = null
+  if (!realtimeSessionsRefreshQueued) return
+  if (!process.client || document.visibilityState === 'hidden') return
+  if (accountBootstrapInProgress || accountChangeInProgress) return
+  if (realtimeSessionsRefreshFuture) return
 
+  realtimeSessionsRefreshQueued = false
+  lastRealtimeSessionsRefreshAt = Date.now()
   realtimeSessionsRefreshFuture = refreshSessionsForSelectedAccount({ sourceOverride: 'auto' }).finally(() => {
     realtimeSessionsRefreshFuture = null
-    if (realtimeSessionsRefreshQueued) {
-      realtimeSessionsRefreshQueued = false
-      queueRealtimeSessionsRefresh()
-    }
+    if (realtimeSessionsRefreshQueued) queueRealtimeSessionsRefresh()
   })
+}
+
+const queueRealtimeSessionsRefresh = () => {
+  realtimeSessionsRefreshQueued = true
+  if (realtimeSessionsRefreshFuture || realtimeSessionsRefreshTimer) return
+
+  const elapsed = Date.now() - lastRealtimeSessionsRefreshAt
+  const delay = Math.max(0, REALTIME_SESSIONS_REFRESH_MIN_INTERVAL_MS - elapsed)
+  realtimeSessionsRefreshTimer = window.setTimeout(runRealtimeSessionsRefresh, delay)
+}
+
+const cancelQueuedRealtimeSessionsRefresh = () => {
+  realtimeSessionsRefreshQueued = false
+  if (!realtimeSessionsRefreshTimer) return
+  window.clearTimeout(realtimeSessionsRefreshTimer)
+  realtimeSessionsRefreshTimer = null
 }
 
 const onAccountChange = async () => {
   if (accountChangeInProgress) return
   accountChangeInProgress = true
+  cancelQueuedRealtimeSessionsRefresh()
   try {
     logChatBootstrap('accountChange:start', {
       selectedAccount: selectedAccount.value
     })
     resetAccountScopedState()
     try {
-      await realtimeStore.enable({ silent: true })
+      await realtimeStore.enable({ silent: true, scope: 'chat' })
       isLoadingContacts.value = true
       contactsError.value = ''
       await loadSessionsForSelectedAccount()
@@ -664,7 +680,12 @@ const onVisibilityChange = () => {
     return
   }
   if (document.visibilityState !== 'visible') return
+  const resumedFromHidden = lastPageHiddenAt > 0
   maybeRefreshMediaOnResume()
+  if (resumedFromHidden && realtimeEnabled.value) {
+    queueRealtimeRefresh()
+    queueRealtimeSessionsRefresh()
+  }
 }
 
 onMounted(async () => {
@@ -693,7 +714,7 @@ onMounted(async () => {
   accountBootstrapInProgress = true
   try {
     await chatAccounts.ensureLoaded()
-    await realtimeStore.enable({ silent: true })
+    await realtimeStore.enable({ silent: true, scope: 'chat' })
     await loadContacts()
   } finally {
     accountBootstrapInProgress = false
@@ -740,12 +761,15 @@ onUnmounted(() => {
 
   if (locateServerIdTimer) clearTimeout(locateServerIdTimer)
   locateServerIdTimer = null
+  cancelQueuedRealtimeSessionsRefresh()
   void realtimeStore.disable({ silent: true })
   stopSessionListResize()
   stopExportPolling()
 })
 
 watch(realtimeChangeSeq, () => {
+  if (!process.client || document.visibilityState === 'hidden') return
+  if (accountBootstrapInProgress || accountChangeInProgress) return
   queueRealtimeRefresh()
   queueRealtimeSessionsRefresh()
 })
