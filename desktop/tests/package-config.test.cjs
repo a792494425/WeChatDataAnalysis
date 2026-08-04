@@ -41,16 +41,22 @@ test("desktop package ships the platform ffmpeg binary and license", () => {
   assert.ok(resource.filter.includes("LICENSE"));
 });
 
-test("macOS package keeps image scanning helpers and stages the new native core trio", () => {
+test("macOS package keeps image scanning resources, removes retired WCDB, and stages the native core trio", () => {
   const nativeRoot = path.join(repoRoot, "src", "wechat_decrypt_tool", "native", "macos");
   const required = [
-    path.join(nativeRoot, "universal", "libWCDB.dylib"),
     path.join(nativeRoot, "universal", "libwx_key.dylib"),
     path.join(nativeRoot, "universal", "image_scan_helper"),
     path.join(nativeRoot, "source", "image_scan_helper.c"),
     path.join(nativeRoot, "source", "image_scan_entitlements.plist"),
+    path.join(nativeRoot, "WEFLOW_LICENSE.txt"),
   ];
   for (const resource of required) assert.ok(fs.existsSync(resource), resource);
+  for (const retiredResource of [
+    path.join(nativeRoot, "arm64", "libwcdb_api.dylib"),
+    path.join(nativeRoot, "universal", "libWCDB.dylib"),
+  ]) {
+    assert.equal(fs.existsSync(retiredResource), false, retiredResource);
+  }
   fs.accessSync(path.join(nativeRoot, "universal", "image_scan_helper"), fs.constants.X_OK);
 
   const buildBackend = fs.readFileSync(
@@ -58,6 +64,16 @@ test("macOS package keeps image scanning helpers and stages the new native core 
     "utf8"
   );
   assert.match(buildBackend, /darwin:\s*\["libwechatdb_client\.dylib", "wechatdb_broker", NATIVE_CORE_MANIFEST\]/);
+});
+
+test("macOS image resources retain WeFlow attribution without retired WCDB notices", () => {
+  const notices = fs.readFileSync(path.join(repoRoot, "THIRD_PARTY_NOTICES.md"), "utf8");
+  assert.match(notices, /WeFlow macOS native resources/);
+  assert.match(notices, /native\/macos\/WEFLOW_LICENSE\.txt/);
+  assert.match(notices, /native\/macos\/universal\/libwx_key\.dylib/);
+  assert.match(notices, /native\/macos\/universal\/image_scan_helper/);
+  assert.doesNotMatch(notices, /libwcdb_api\.dylib/);
+  assert.doesNotMatch(notices, /libWCDB\.dylib/);
 });
 
 test("Windows package uses private-PKI signing while preserving producer signatures", () => {
@@ -241,6 +257,10 @@ test("macOS release exposes a reusable packaged smoke test", () => {
   const smokeScript = path.join(desktopRoot, "scripts", "smoke-macos-package.cjs");
   assert.equal(packageJson.scripts["smoke:mac"], "node scripts/smoke-macos-package.cjs");
   assert.equal(
+    packageJson.scripts["smoke:mac:image-scan"],
+    "node scripts/smoke-macos-package.cjs --synthetic-image-scan"
+  );
+  assert.equal(
     packageJson.scripts["verify:mac:distribution"],
     "node scripts/verify-macos-distribution.cjs"
   );
@@ -248,6 +268,8 @@ test("macOS release exposes a reusable packaged smoke test", () => {
   const smokeSource = fs.readFileSync(smokeScript, "utf8");
   assert.match(smokeSource, /libwechatdb_client\.dylib/);
   assert.match(smokeSource, /wechatdb_native_build\.json/);
+  assert.match(smokeSource, /macosXkeyContract/);
+  assert.match(smokeSource, /database_key_online_authorization_required/);
   assert.match(smokeSource, /\/api\/health/);
   assert.doesNotMatch(smokeSource, /require\(["']koffi["']\)/);
   assert.doesNotMatch(smokeSource, /sidecarProc|sidecarPort|sidecarToken/);
@@ -277,28 +299,25 @@ test("macOS native resources expose reproducible build and architecture verifica
   assert.match(buildScript, /"x86_64"/);
   assert.match(verifyScript, /only arm64 is complete/);
   assert.match(verifyScript, /maximumNativeMinOS/);
-  assert.match(verifyScript, /@loader_path\/\.\.\/universal\/libWCDB\.dylib/);
   assert.match(verifyScript, /ffmpeg-static/);
-  assert.match(verifyScript, /darwin_arm64/);
-  assert.match(verifyScript, /run\("nm", \["-gU", filePath\]\)/);
-  for (const symbol of [
-    "InitProtection",
-    "wcdb_init",
-    "wcdb_open_account",
-    "wcdb_close_account",
-    "wcdb_set_my_wxid",
-    "wcdb_get_sessions",
-    "wcdb_get_messages",
-    "wcdb_open_message_cursor",
-    "wcdb_fetch_message_batch",
-    "wcdb_get_contacts_compact",
-    "wcdb_get_sns_timeline",
-    "wcdb_list_media_dbs",
-    "wcdb_scan_media_stream",
-    "wcdb_exec_query",
-    "wcdb_free_string",
+  assert.match(verifyScript, /resolveNativeCoreArtifacts\(\{[\s\S]*platform:\s*"darwin"/);
+  for (const resource of [
+    "libwechatdb_client.dylib",
+    "wechatdb_broker",
+    "wechatdb_native_build.json",
+    "libwx_key.dylib",
+    "image_scan_helper",
   ]) {
-    assert.match(verifyScript, new RegExp(`"${symbol}"`));
+    assert.match(verifyScript, new RegExp(resource.replace(".", "\\.")));
+  }
+  for (const retiredResource of [
+    "libwcdb_api.dylib",
+    "libWCDB.dylib",
+    "koffi",
+    "InitProtection",
+    "wcdb_open_account",
+  ]) {
+    assert.doesNotMatch(verifyScript, new RegExp(retiredResource.replace(".", "\\.")));
   }
 });
 
@@ -344,11 +363,33 @@ test("macOS package smoke performs a real image-key memory scan", () => {
     "utf8"
   );
 
-  assert.match(smokeScript, /image_key_candidate\[33\]/);
+  assert.match(smokeScript, /IMAGE_KEY_MAPPING_ADDRESS/);
+  assert.match(smokeScript, /0x1000000ULL/);
+  assert.match(smokeScript, /mach_vm_allocate/);
+  assert.match(smokeScript, /VM_FLAGS_FIXED/);
+  assert.doesNotMatch(smokeScript, /MAP_FIXED/);
+  assert.match(smokeScript, /-Wl,-pagezero_size,0x1000000/);
+  assert.doesNotMatch(smokeScript, /-Wl,-no_pie|-Wl,-segaddr/);
+  assert.match(smokeScript, /_dyld_get_image_header\(0\)/);
+  assert.match(smokeScript, /memcpy\(\(void \*\)\(uintptr_t\)image_key_mapping, "0123456789abcdef", 16\)/);
+  assert.match(smokeScript, /ready mapping=0x%llx image=0x%llx/);
   assert.match(smokeScript, /createCipheriv\("aes-128-ecb"/);
   assert.match(smokeScript, /spawnSync\(imageHelper/);
   assert.match(smokeScript, /Buffer\.from\(helperPayload\.aesKey, "hex"\)/);
+  assert.match(smokeScript, /if \(runSyntheticImageScan\)/);
   assert.match(smokeScript, /await probePackagedImageScanner\(imageHelper, tempRoot\)/);
+  assert.match(smokeScript, /SYNTHETIC_IMAGE_SCAN_FLAG = "--synthetic-image-scan"/);
+  assert.match(smokeScript, /timeout: 30_000/);
+  assert.match(smokeScript, /30-second production budget/);
+
+  const workflow = fs.readFileSync(
+    path.join(repoRoot, ".github", "workflows", "macos-private-build.yml"),
+    "utf8"
+  );
+  assert.match(workflow, /run_image_scan_diagnostic:/);
+  assert.match(workflow, /if: \$\{\{ inputs\.run_image_scan_diagnostic \}\}/);
+  assert.match(workflow, /continue-on-error: true/);
+  assert.match(workflow, /npm run smoke:mac:image-scan/);
 });
 
 test("unsigned macOS CI packages are ad-hoc sealed before DMG creation", () => {
@@ -390,6 +431,54 @@ test("macOS archive verification checks ZIP, mounted DMG, signing, and distribut
   assert.match(verifier, /syspolicy_check/);
   assert.match(verifier, /stapler/);
   assert.match(verifier, /withMacosArtifacts/);
+  assert.match(verifier, /macosXkeyContract\.checksumsFileName/);
+  assert.match(verifier, /macosXkeyContract\.provenanceFileName/);
+  assert.match(verifier, /macosXkeyContract\.thirdPartyNoticeFileName/);
+  assert.match(
+    verifier,
+    /validatePackagedBackend\(\{ backendDir: backendRoot, platform: "darwin" \}\)/
+  );
+  for (const nativeCoreResource of [
+    "libwechatdb_client.dylib",
+    "wechatdb_broker",
+    "wechatdb_native_build.json",
+  ]) {
+    assert.match(verifier, new RegExp(nativeCoreResource.replace(".", "\\.")));
+  }
+  assert.match(verifier, /requireArchitectures\(nativeClient, \["arm64"\]\)/);
+  assert.match(verifier, /requireArchitectures\(nativeBroker, \["arm64"\]\)/);
+  assert.match(verifier, /requireCompatibleMinimumOs\(filePath\)/);
+  assert.match(
+    verifier,
+    /codesign", \["--verify", "--strict", "--verbose=2", nativeClient\]/
+  );
+  assert.match(
+    verifier,
+    /codesign", \["--verify", "--strict", "--verbose=2", nativeBroker\]/
+  );
+  const retiredVerifierBlock = verifier.match(
+    /for \(const retiredPath of \[([\s\S]*?)\]\) \{([\s\S]*?)\n  \}/
+  )?.[0] || "";
+  for (const retiredResource of ["libwcdb_api.dylib", "libWCDB.dylib", "wcdb-sidecar.cjs", "koffi"]) {
+    assert.match(retiredVerifierBlock, new RegExp(retiredResource.replace(".", "\\.")));
+  }
+  assert.match(
+    retiredVerifierBlock,
+    /assert\.equal\(fs\.existsSync\(retiredPath\), false, `Retired WCDB runtime was packaged:/
+  );
+  const retiredSmokeBlock = smoke.match(
+    /for \(const retiredPath of \[([\s\S]*?)\]\) \{([\s\S]*?)\n  \}/
+  )?.[0] || "";
+  for (const retiredResource of ["libwcdb_api.dylib", "libWCDB.dylib", "wcdb-sidecar.cjs", "koffi"]) {
+    assert.match(retiredSmokeBlock, new RegExp(retiredResource.replace(".", "\\.")));
+  }
+  const xkeyContract = JSON.parse(fs.readFileSync(
+    path.join(repoRoot, "src", "wechat_decrypt_tool", "resources", "macos_db_key_contract.json"),
+    "utf8"
+  ));
+  for (const [, field] of verifier.matchAll(/macosXkeyContract\.([A-Za-z0-9_]+)/g)) {
+    assert.ok(Object.hasOwn(xkeyContract, field), `unknown macOS Xkey contract field: ${field}`);
+  }
   assert.match(smoke, /withMacosArtifacts\(\{ distribution: false \}, async \(\{ zipAppPath \}\)/);
   assert.match(smoke, /runPackagedRuntimeSmoke\(zipAppPath\)/);
   assert.doesNotMatch(smoke, /findPackagedApp/);
@@ -451,7 +540,7 @@ test("Windows packages are built only by the tag-triggered release workflow", ()
 
   for (const entry of fs.readdirSync(workflowsDir)) {
     const source = fs.readFileSync(path.join(workflowsDir, entry), "utf8");
-    if (!/npm run (dist|smoke):/.test(source)) continue;
+    if (!/npm run (?:dist|smoke):win/.test(source)) continue;
     assert.equal(
       entry,
       "release.yml",

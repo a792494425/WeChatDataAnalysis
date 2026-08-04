@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -8,6 +9,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { verifyAppBundle, withMacosArtifacts } = require("./macos-package-verifier.cjs");
+const { contract: macosXkeyContract } = require("./macos-xkey-packaging.cjs");
 
 const { validatePackagedBackend } = require("./native-core-before-pack.cjs");
 const {
@@ -19,6 +21,8 @@ const {
 const desktopRoot = path.resolve(__dirname, "..");
 const SUPPORTED_ARCHITECTURE = "arm64";
 const PACKAGE_MINIMUM_MACOS_VERSION = "15.0";
+const SYNTHETIC_IMAGE_SCAN_FLAG = "--synthetic-image-scan";
+const runSyntheticImageScan = process.argv.slice(2).includes(SYNTHETIC_IMAGE_SCAN_FLAG);
 
 function fail(message) {
   throw new Error(message);
@@ -194,15 +198,45 @@ async function probePackagedImageScanner(imageHelper, tempRoot) {
   const targetPath = path.join(tempRoot, "image-key-target");
   fs.writeFileSync(sourcePath, `
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach-o/dyld.h>
 #include <unistd.h>
 
-__attribute__((used)) volatile char image_key_candidate[33] =
-    "0123456789abcdef0123456789abcdef";
+#define IMAGE_KEY_MAPPING_ADDRESS ((mach_vm_address_t)0x1000000ULL)
+#define IMAGE_KEY_MAPPING_SIZE 0x4000
 
 int main(void) {
-    if (image_key_candidate[0] == '\\0') return 1;
-    puts("ready");
+    uintptr_t image_base = (uintptr_t)_dyld_get_image_header(0);
+    if (image_base <= (uintptr_t)IMAGE_KEY_MAPPING_ADDRESS) {
+        fprintf(stderr, "synthetic image base is not above probe mapping: 0x%llx\\n",
+                (unsigned long long)image_base);
+        return 1;
+    }
+
+    mach_vm_address_t image_key_mapping = IMAGE_KEY_MAPPING_ADDRESS;
+    kern_return_t allocation_result = mach_vm_allocate(
+        mach_task_self(),
+        &image_key_mapping,
+        IMAGE_KEY_MAPPING_SIZE,
+        VM_FLAGS_FIXED
+    );
+    if (allocation_result != KERN_SUCCESS) {
+        fprintf(stderr, "mach_vm_allocate image-key probe failed: %d\\n", allocation_result);
+        return 2;
+    }
+    if (image_key_mapping != IMAGE_KEY_MAPPING_ADDRESS) {
+        fprintf(stderr, "unexpected image-key mapping: 0x%llx\\n", image_key_mapping);
+        return 3;
+    }
+
+    memcpy((void *)(uintptr_t)image_key_mapping, "0123456789abcdef", 16);
+    printf("ready mapping=0x%llx image=0x%llx\\n",
+           image_key_mapping,
+           (unsigned long long)image_base);
     fflush(stdout);
     for (;;) pause();
 }
@@ -213,6 +247,10 @@ int main(void) {
     SUPPORTED_ARCHITECTURE,
     `-mmacosx-version-min=${PACKAGE_MINIMUM_MACOS_VERSION}`,
     "-O0",
+    // Shrink PAGEZERO only for this throwaway target. The fixed page directly
+    // after it becomes the first readable/writable region without relocating
+    // the normal PIE image or colliding with macOS's dyld shared cache.
+    "-Wl,-pagezero_size,0x1000000",
     sourcePath,
     "-o",
     targetPath,
@@ -221,7 +259,10 @@ int main(void) {
   let targetProc = null;
   try {
     targetProc = startProcess(targetPath, [], { cwd: tempRoot, env: process.env });
-    await waitForProcessOutput(targetProc, /(?:^|\n)ready\n/);
+    await waitForProcessOutput(
+      targetProc,
+      /(?:^|\n)ready mapping=0x[0-9a-f]+ image=0x[0-9a-f]+\n/i
+    );
     assert.ok(Number(targetProc.pid) > 0, "synthetic image-key target has no PID");
 
     const expectedKey = "0123456789abcdef";
@@ -232,10 +273,17 @@ int main(void) {
     const helperProbe = spawnSync(imageHelper, [String(targetProc.pid), ciphertext.toString("hex")], {
       encoding: "utf8",
       stdio: "pipe",
-      timeout: 15_000,
+      // Match the production direct-helper budget. The first invocation on a
+      // clean macOS VM also pays dyld and private-PKI validation cold-start cost.
+      timeout: 30_000,
     });
-    assert.ifError(helperProbe.error);
     const helperOutput = `${helperProbe.stdout || ""}\n${helperProbe.stderr || ""}`;
+    if (helperProbe.error) {
+      throw new Error(
+        `Packaged image helper failed or exceeded the 30-second production budget: ` +
+        `${helperProbe.error.message}\n${helperOutput}`
+      );
+    }
     assert.equal(helperProbe.status, 0, helperOutput);
     assert.doesNotMatch(helperOutput, /dlopen failed|symbol not found/i);
 
@@ -264,9 +312,10 @@ async function runPackagedRuntimeSmoke(appPath) {
   const nativeClient = path.join(nativeRoot, "libwechatdb_client.dylib");
   const nativeBroker = path.join(nativeRoot, "wechatdb_broker");
   const nativeManifest = path.join(nativeRoot, "wechatdb_native_build.json");
-  const wcdb = path.join(nativeRoot, "macos", "universal", "libWCDB.dylib");
   const imageLibrary = path.join(nativeRoot, "macos", "universal", "libwx_key.dylib");
   const imageHelper = path.join(nativeRoot, "macos", "universal", "image_scan_helper");
+  const xkeyRoot = path.join(nativeRoot, ...String(macosXkeyContract.bundleRelativePath).split("/"));
+  const xkeyHelper = path.join(xkeyRoot, macosXkeyContract.helperFileName);
   const integrity = path.join(nativeRoot, "libwce_integrity.dylib");
   const ffmpeg = path.join(resources, "ffmpeg", "ffmpeg");
 
@@ -276,20 +325,38 @@ async function runPackagedRuntimeSmoke(appPath) {
     nativeClient,
     nativeBroker,
     nativeManifest,
-    wcdb,
     imageLibrary,
     imageHelper,
+    xkeyHelper,
     integrity,
     ffmpeg,
   ]) {
     requirePath(filePath, {
-      executable: [electronExecutable, backend, nativeBroker, imageHelper, ffmpeg].includes(filePath),
+      executable: [electronExecutable, backend, nativeBroker, imageHelper, xkeyHelper, ffmpeg].includes(filePath),
     });
   }
   requirePath(path.join(resources, "backend", "THIRD_PARTY_NOTICES.md"));
   requirePath(path.join(nativeRoot, "macos", "WEFLOW_LICENSE.txt"));
   requirePath(path.join(resources, "ffmpeg", "LICENSE"));
   requirePath(path.join(resources, "ffmpeg", "ffmpeg.LICENSE"));
+  for (const name of [
+    macosXkeyContract.manifestFileName,
+    macosXkeyContract.trustFileName,
+    macosXkeyContract.checksumsFileName,
+    macosXkeyContract.provenanceFileName,
+    macosXkeyContract.thirdPartyNoticeFileName,
+  ]) {
+    requirePath(path.join(xkeyRoot, name));
+  }
+  const xkeyManifest = JSON.parse(
+    fs.readFileSync(path.join(xkeyRoot, macosXkeyContract.manifestFileName), "utf8")
+  );
+  const fridaNotice = fs.readFileSync(path.join(xkeyRoot, macosXkeyContract.thirdPartyNoticeFileName));
+  assert.equal(
+    crypto.createHash("sha256").update(fridaNotice).digest("hex"),
+    xkeyManifest.files[macosXkeyContract.thirdPartyNoticeFileName].sha256,
+    "Packaged Frida license notice differs from the producer manifest"
+  );
 
   const packageMinimumOS = run(
     "plutil",
@@ -304,6 +371,7 @@ async function runPackagedRuntimeSmoke(appPath) {
 
   for (const retiredPath of [
     path.join(nativeRoot, "macos", "arm64", "libwcdb_api.dylib"),
+    path.join(nativeRoot, "macos", "universal", "libWCDB.dylib"),
     path.join(resources, "wcdb-sidecar.cjs"),
     path.join(resources, "app.asar.unpacked", "node_modules", "koffi"),
   ]) {
@@ -329,9 +397,9 @@ async function runPackagedRuntimeSmoke(appPath) {
   assertArchitecture(nativeClient, "arm64");
   assertArchitecture(nativeBroker, "arm64");
   assertArchitecture(integrity, "arm64");
-  assertArchitecture(wcdb, "arm64", { universal: true });
   assertArchitecture(imageLibrary, "arm64", { universal: true });
   assertArchitecture(imageHelper, "arm64", { universal: true });
+  assertArchitecture(xkeyHelper, "arm64", { universal: true });
   assertArchitecture(ffmpeg, "arm64");
 
   for (const filePath of [
@@ -339,9 +407,9 @@ async function runPackagedRuntimeSmoke(appPath) {
     backend,
     nativeClient,
     nativeBroker,
-    wcdb,
     imageLibrary,
     imageHelper,
+    xkeyHelper,
     integrity,
     ffmpeg,
   ]) {
@@ -363,6 +431,8 @@ async function runPackagedRuntimeSmoke(appPath) {
 
   run("codesign", ["--verify", "--strict", "--verbose=2", nativeClient]);
   run("codesign", ["--verify", "--strict", "--verbose=2", nativeBroker]);
+  run("codesign", ["--verify", "--strict", "--verbose=2", integrity]);
+  run("codesign", ["--verify", "--strict", "--verbose=2", xkeyHelper]);
   run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath]);
   const entitlements = run("codesign", ["-d", "--entitlements", "-", electronExecutable], { capture: true });
   assert.match(entitlements, /com\.apple\.security\.cs\.allow-jit/);
@@ -372,7 +442,9 @@ async function runPackagedRuntimeSmoke(appPath) {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wda-macos-smoke-"));
   let backendProc = null;
   try {
-    await probePackagedImageScanner(imageHelper, tempRoot);
+    if (runSyntheticImageScan) {
+      await probePackagedImageScanner(imageHelper, tempRoot);
+    }
 
     const backendPort = await getFreePort();
     const backendEnv = {
@@ -415,6 +487,21 @@ async function runPackagedRuntimeSmoke(appPath) {
     assert.equal(health.statusCode, 200, health.text || backendProc.output());
     assert.equal(health.body?.status, "healthy");
     assert.equal(health.body?.service, "微信解密工具");
+    const capabilities = await waitForJson(`http://127.0.0.1:${backendPort}/api/system/platform`);
+    assert.equal(capabilities.statusCode, 200, capabilities.text || backendProc.output());
+    assert.equal(capabilities.body?.platform, "macos");
+    const capabilityEvidence = JSON.stringify(capabilities.body || {});
+    assert.equal(
+      capabilities.body?.database_key_extraction,
+      true,
+      `Packaged database-key capability is unavailable: ${capabilityEvidence}`
+    );
+    assert.equal(
+      capabilities.body?.database_key_online_authorization_required,
+      true,
+      `Packaged database-key authorization policy is invalid: ${capabilityEvidence}`
+    );
+    assert.match(String(capabilities.body?.database_key_build_id || ""), /^[A-Za-z0-9._-]+$/);
   } finally {
     await stopProcess(backendProc);
     fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -431,7 +518,9 @@ async function main() {
     fail(`Apple Silicon runner required, got ${process.arch}`);
   }
 
-  const explicitAppPath = String(process.argv[2] || "").trim();
+  const explicitAppPath = String(
+    process.argv.slice(2).find((arg) => arg !== SYNTHETIC_IMAGE_SCAN_FLAG) || ""
+  ).trim();
   if (explicitAppPath) {
     const appPath = path.resolve(explicitAppPath);
     verifyAppBundle(appPath, { distribution: false, source: "explicit app bundle" });

@@ -1,6 +1,17 @@
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const {
+  contract: MACOS_XKEY_CONTRACT,
+  stageMacosXkeyArtifacts,
+} = require("./macos-xkey-packaging.cjs");
+const {
+  macosNativeManifestErrors,
+  resolveMacosNativeCoreArtifacts,
+} = require("./macos-native-core-packaging.cjs");
+const {
+  resolveIntegrityNativeArtifact,
+} = require("./integrity-native-packaging.cjs");
 
 const repoRoot = path.resolve(__dirname, "..", "..");
 const entry = path.join(repoRoot, "src", "wechat_decrypt_tool", "backend_entry.py");
@@ -13,6 +24,13 @@ const runtimeNativeDir = path.join(repoRoot, "desktop", "build", "native-runtime
 const skillDir = path.join(repoRoot, "skills", "wechat-mcp-copilot");
 const projectToml = path.join(repoRoot, "pyproject.toml");
 const thirdPartyNotices = path.join(repoRoot, "THIRD_PARTY_NOTICES.md");
+const macosXkeyContractPath = path.join(
+  repoRoot,
+  "src",
+  "wechat_decrypt_tool",
+  "resources",
+  "macos_db_key_contract.json"
+);
 
 const NATIVE_CORE_MANIFEST = "wechatdb_native_build.json";
 const NATIVE_CORE_ARTIFACTS = Object.freeze({
@@ -20,7 +38,12 @@ const NATIVE_CORE_ARTIFACTS = Object.freeze({
   darwin: ["libwechatdb_client.dylib", "wechatdb_broker", NATIVE_CORE_MANIFEST],
 });
 const NATIVE_CORE_FILE_NAMES = new Set(Object.values(NATIVE_CORE_ARTIFACTS).flat());
-const LEGACY_WCDB_FILE_NAMES = new Set(["wcdb_api.dll", "WCDB.dll", "libwcdb_api.dylib"]);
+const LEGACY_WCDB_FILE_NAMES = new Set([
+  "wcdb_api.dll",
+  "WCDB.dll",
+  "libwcdb_api.dylib",
+  "libWCDB.dylib",
+]);
 const TRUE_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSE_VALUES = new Set(["", "0", "false", "no", "off"]);
 const NON_PRODUCTION_BUILD_ID_PATTERN =
@@ -58,7 +81,15 @@ function nativeCoreManifestErrors(manifest) {
   if (!manifest || Array.isArray(manifest) || typeof manifest !== "object") {
     return ["manifest must be a JSON object"];
   }
-  if (manifest.schemaVersion !== 2) errors.push("schemaVersion must equal 2");
+  if (!new Set([2, 3]).has(manifest.schemaVersion)) {
+    errors.push("schemaVersion must equal 2 or 3");
+  }
+  if (manifest.schemaVersion === 3 && manifest.platform !== "macos") {
+    errors.push("schemaVersion 3 requires platform macos");
+  }
+  if (manifest.schemaVersion === 2 && Object.prototype.hasOwnProperty.call(manifest, "platform")) {
+    errors.push("schemaVersion 2 must not declare platform");
+  }
   if (typeof manifest.buildId !== "string" || manifest.buildId.trim() === "") {
     errors.push("buildId must be a non-empty string");
   }
@@ -92,6 +123,9 @@ function nativeCoreProductionManifestErrors(
   manifest,
   { nowUnix = Math.floor(Date.now() / 1000) } = {}
 ) {
+  if (manifest?.schemaVersion === 3) {
+    return macosNativeManifestErrors(manifest, { nowUnix });
+  }
   const errors = nativeCoreManifestErrors(manifest);
   const buildIssuedAtUnix = manifest?.buildIssuedAtUnix;
   const buildExpiresAtUnix = manifest?.buildExpiresAtUnix;
@@ -213,6 +247,11 @@ function resolveNativeCoreArtifacts({ env = process.env, platform = process.plat
     );
   }
 
+  if (platform === "darwin" && !allowDevelopment) {
+    const resolved = resolveMacosNativeCoreArtifacts({ env, platform });
+    return { ...resolved, allowDevelopment: false, required: true };
+  }
+
   const artifactDir = path.resolve(explicitValue);
   let directoryStat;
   try {
@@ -263,6 +302,10 @@ function prepareRuntimeNativeDir(sourceDir, destinationDir) {
     filter(sourcePath) {
       const relative = path.relative(sourceDir, sourcePath);
       if (!relative) return true;
+      const normalizedRelative = relative.split(path.sep).join("/");
+      if (normalizedRelative === "macos/db-key" || normalizedRelative.startsWith("macos/db-key/")) {
+        return false;
+      }
       const name = path.basename(relative);
       return !NATIVE_CORE_FILE_NAMES.has(name) && !LEGACY_WCDB_FILE_NAMES.has(name);
     },
@@ -272,7 +315,24 @@ function prepareRuntimeNativeDir(sourceDir, destinationDir) {
 function buildIntegrityNativeBinary({ env = process.env, platform = process.platform } = {}) {
   if (platform !== "darwin" && platform !== "linux") return null;
 
+  const artifactDir = String(env.WCE_INTEGRITY_ARTIFACT_DIR || "").trim();
+  if (platform === "darwin" && artifactDir) {
+    return resolveIntegrityNativeArtifact({ env, platform }).binaryPath;
+  }
+  const distributionRequired = platform === "darwin" && (
+    parseBooleanEnv(env, "WCE_INTEGRITY_REQUIRED") ||
+    String(env.MACOS_DISTRIBUTION_BUILD || "").trim() === "1"
+  );
+  if (distributionRequired) {
+    throw new Error("A pinned macOS wce_integrity production artifact is required.");
+  }
+
   const integrityManifest = path.join(repoRoot, "native", "wce_integrity", "Cargo.toml");
+  if (!fs.existsSync(integrityManifest)) {
+    throw new Error(
+      "Private wce_integrity source is unavailable. Configure WCE_INTEGRITY_ARTIFACT_DIR for macOS packaging."
+    );
+  }
   const integrityTargetDir = path.join(repoRoot, "native", "wce_integrity", "target", "release");
   const fileName = platform === "darwin" ? "libwce_integrity.dylib" : "libwce_integrity.so";
   const result = spawnSync(
@@ -305,9 +365,18 @@ function validateRuntimeNativeHelpers(destinationDir, platform = process.platfor
     throw new Error(`Missing macOS image scan helper: ${imageScanHelper}`);
   }
   fs.chmodSync(imageScanHelper, 0o755);
+  const databaseKeyHelper = path.join(
+    destinationDir,
+    ...String(MACOS_XKEY_CONTRACT.bundleRelativePath).split("/"),
+    MACOS_XKEY_CONTRACT.helperFileName
+  );
+  if (!fs.existsSync(databaseKeyHelper)) {
+    throw new Error(`Missing controlled macOS database key helper: ${databaseKeyHelper}`);
+  }
+  fs.chmodSync(databaseKeyHelper, 0o755);
 }
 
-function runIntegrityPreflight(env = process.env) {
+function runIntegrityPreflight(env = process.env, integrityNativeBinary = null) {
   const result = spawnSync(
     "uv",
     [
@@ -326,6 +395,9 @@ function runIntegrityPreflight(env = process.env) {
       cwd: repoRoot,
       env: {
         ...env,
+        ...(integrityNativeBinary
+          ? { WCE_INTEGRITY_NATIVE_PATH: path.resolve(integrityNativeBinary) }
+          : {}),
         PYTHONPATH: [path.join(repoRoot, "src"), env.PYTHONPATH || ""].filter(Boolean).join(path.delimiter),
       },
       stdio: "inherit",
@@ -421,8 +493,9 @@ function main() {
   const integrityNativeBinary = buildIntegrityNativeBinary();
   prepareRuntimeNativeDir(nativeDir, runtimeNativeDir);
   stageNativeCoreArtifacts();
+  stageMacosXkeyArtifacts({ destinationNativeDir: runtimeNativeDir });
   validateRuntimeNativeHelpers(runtimeNativeDir);
-  runIntegrityPreflight();
+  runIntegrityPreflight(process.env, integrityNativeBinary);
 
   const desktopPackageJsonPath = path.join(repoRoot, "desktop", "package.json");
   let desktopVersion = "1.3.0";
@@ -456,6 +529,8 @@ function main() {
     pyInstallerAddData(runtimeNativeDir, "wechat_decrypt_tool/native"),
     "--add-data",
     pyInstallerAddData(skillDir, "skills/wechat-mcp-copilot"),
+    "--add-data",
+    pyInstallerAddData(macosXkeyContractPath, "wechat_decrypt_tool/resources"),
     entry,
   ];
 
@@ -510,6 +585,7 @@ module.exports = {
   nativeCoreArtifactNames,
   nativeCoreManifestErrors,
   nativeCoreProductionManifestErrors,
+  buildIntegrityNativeBinary,
   prepareRuntimeNativeDir,
   resolveNativeCoreArtifacts,
   stageNativeCoreArtifacts,
