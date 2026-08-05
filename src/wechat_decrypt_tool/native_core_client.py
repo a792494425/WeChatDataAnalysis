@@ -33,6 +33,7 @@ ENV_NATIVE_CORE_ALLOW_DEVELOPMENT_BUILD = (
 ENV_NATIVE_CORE_ALLOW_STAGING_BUILD = (
     "WECHAT_TOOL_NATIVE_CORE_ALLOW_STAGING_BUILD_FOR_TESTS"
 )
+ENV_SOURCE_NATIVE_CORE_DIR = "WCE_NATIVE_CORE_SOURCE_DIR"
 
 _NATIVE_CORE_BUILD_MANIFEST_NAME = "wechatdb_native_build.json"
 _NATIVE_CORE_BUILD_MANIFEST_MAX_BYTES = 16 * 1024
@@ -399,6 +400,8 @@ class NativeCoreBuildManifest:
     macos_client_signing_identifier: str = ""
     macos_broker_signing_identifier: str = ""
     macos_host_signing_identifier: str = ""
+    source_runtime: bool = False
+    macos_host_verification: str = ""
 
     @property
     def client_signer_sha256(self) -> bytes:
@@ -825,6 +828,29 @@ def _load_native_core_build_manifest(
         raise NativeCoreProtocolError(
             "wechatdb native schemaVersion 2 must not declare a platform."
         )
+    source_runtime_fields = {
+        name for name in ("sourceRuntime", "macosHostVerification") if name in payload
+    }
+    source_runtime = False
+    macos_host_verification = ""
+    if schema_version == 2 and source_runtime_fields:
+        raise NativeCoreProtocolError(
+            "Windows wechatdb native manifests must not declare macOS source-runtime fields."
+        )
+    if schema_version == 3 and source_runtime_fields:
+        if source_runtime_fields != {"sourceRuntime", "macosHostVerification"}:
+            raise NativeCoreProtocolError(
+                "macOS source-runtime fields must be declared together."
+            )
+        if (
+            payload.get("sourceRuntime") is not True
+            or payload.get("macosHostVerification") != "same-user-direct-parent"
+        ):
+            raise NativeCoreProtocolError(
+                "macOS source-runtime host verification policy is invalid."
+            )
+        source_runtime = True
+        macos_host_verification = "same-user-direct-parent"
     if (
         not isinstance(build_id, str)
         or not _NATIVE_CORE_BUILD_ID_PATTERN.fullmatch(build_id)
@@ -844,6 +870,16 @@ def _load_native_core_build_manifest(
     ):
         raise NativeCoreProtocolError(
             "wechatdb native build manifest security fields must be booleans."
+        )
+    if source_runtime and (
+        development_build
+        or not code_signature_enforced
+        or not root_public_key_compiled
+        or test_hooks_enabled
+        or staging_pinned_signer_trust
+    ):
+        raise NativeCoreProtocolError(
+            "macOS source-runtime manifests must retain the production security profile."
         )
     macos_client_signer_digest = bytes(32)
     macos_broker_signer_digest = bytes(32)
@@ -1061,6 +1097,8 @@ def _load_native_core_build_manifest(
         macos_client_signing_identifier=macos_client_identifier,
         macos_broker_signing_identifier=macos_broker_identifier,
         macos_host_signing_identifier=macos_host_identifier,
+        source_runtime=source_runtime,
+        macos_host_verification=macos_host_verification,
     )
 
 
@@ -1077,6 +1115,34 @@ def _required_native_core_build_manifest(
     if not _manifest_matches_runtime_platform(manifest):
         raise NativeCoreProtocolError(
             "wechatdb native build manifest does not match the current platform."
+        )
+    frozen = bool(getattr(sys, "frozen", False))
+    if manifest.platform == "macos":
+        if (
+            frozen
+            and _is_production_native_core_build_manifest(manifest)
+            and not manifest.source_runtime
+        ):
+            from .native_core_lease import validate_native_core_authorization_policy
+
+            validate_native_core_authorization_policy(manifest)
+            return manifest
+        if not frozen and _is_source_public_native_core_build_manifest(manifest):
+            from .native_core_lease import validate_native_core_authorization_policy
+
+            validate_native_core_authorization_policy(manifest)
+            return manifest
+        if frozen and manifest.source_runtime:
+            raise NativeCoreProtocolError(
+                "Frozen WeChatDataAnalysis rejects the source-public macOS native core."
+            )
+        if not frozen:
+            raise NativeCoreProtocolError(
+                "Source WeChatDataAnalysis on macOS requires the exact restricted "
+                "source-public native core."
+            )
+        raise NativeCoreProtocolError(
+            "Frozen WeChatDataAnalysis requires a production wechatdb native core."
         )
     if _is_production_native_core_build_manifest(manifest):
         from .native_core_lease import validate_native_core_authorization_policy
@@ -1108,7 +1174,8 @@ def _required_native_core_build_manifest(
         return manifest
     raise NativeCoreProtocolError(
         "Source WeChatDataAnalysis requires the exact dev-local native core and "
-        "an entrypoint-controlled development lease."
+        f"an explicit {ENV_NATIVE_CORE_ALLOW_DEVELOPMENT_BUILD}=1 "
+        "entrypoint-controlled development lease."
     )
 
 
@@ -1158,6 +1225,17 @@ def _is_staging_native_core_build_manifest(manifest: NativeCoreBuildManifest) ->
         == _NATIVE_CORE_OFFLINE_BOOTSTRAP_FEATURES
         and manifest.offline_export_seal_format == "WES2"
         and _NATIVE_CORE_STAGING_BUILD_ID_PATTERN.fullmatch(manifest.build_id) is not None
+    )
+
+
+def _is_source_public_native_core_build_manifest(
+    manifest: NativeCoreBuildManifest,
+) -> bool:
+    return (
+        manifest.platform == "macos"
+        and manifest.source_runtime
+        and manifest.macos_host_verification == "same-user-direct-parent"
+        and _is_production_native_core_build_manifest(manifest)
     )
 
 
@@ -1264,6 +1342,15 @@ def _native_core_broker_name() -> str:
 def _native_core_entrypoint_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent / "native"
+    if sys.platform == "darwin":
+        configured = str(os.environ.get(ENV_SOURCE_NATIVE_CORE_DIR, "") or "").strip()
+        if configured:
+            try:
+                return Path(configured).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise NativeCoreComponentMissingError(
+                    f"Configured macOS source native-core directory is invalid: {configured}"
+                ) from exc
     return Path(__file__).resolve().parent / "native"
 
 
@@ -1328,30 +1415,9 @@ def configure_native_core_entrypoint() -> NativeCoreBuildManifest:
         native_directory / _NATIVE_CORE_BUILD_MANIFEST_NAME
     )
 
-    manifest = _load_native_core_build_manifest(library_path)
-    if not _manifest_matches_runtime_platform(manifest):
-        raise NativeCoreProtocolError(
-            "wechatdb native build manifest does not match the current platform."
-        )
-    if _is_production_native_core_build_manifest(manifest):
-        from .native_core_lease import validate_native_core_authorization_policy
-
+    manifest = _required_native_core_build_manifest(library_path)
+    if not manifest.development_build:
         os.environ.pop(ENV_NATIVE_CORE_ALLOW_DEVELOPMENT_BUILD, None)
-        validate_native_core_authorization_policy(manifest)
-    elif getattr(sys, "frozen", False):
-        if not _is_production_native_core_build_manifest(manifest):
-            raise NativeCoreProtocolError(
-                "Frozen WeChatDataAnalysis rejected a non-production wechatdb native core."
-            )
-    elif _is_development_native_core_build_manifest(manifest):
-        from .native_core_lease import validate_native_core_authorization_policy
-
-        validate_native_core_authorization_policy(manifest)
-    else:
-        os.environ.pop(ENV_NATIVE_CORE_ALLOW_DEVELOPMENT_BUILD, None)
-        raise NativeCoreProtocolError(
-            "WeChatDataAnalysis rejected an invalid wechatdb native build profile."
-        )
 
     _lock_native_core_component_environment(ENV_NATIVE_CORE_LIBRARY, library_path)
     _lock_native_core_component_environment(_ENV_NATIVE_CORE_BROKER, broker_path)
@@ -2905,6 +2971,7 @@ __all__ = [
     "ENV_NATIVE_CORE_ENDPOINT",
     "ENV_NATIVE_CORE_LIBRARY",
     "ENV_NATIVE_CORE_MODE",
+    "ENV_SOURCE_NATIVE_CORE_DIR",
     "NativeCoreClient",
     "NativeCoreBuildManifest",
     "NativeCoreComponentMissingError",

@@ -15,6 +15,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from wechat_decrypt_tool import key_service, platform_support
 from wechat_decrypt_tool.image_key_resolver import ImageKeyResolution, TemplateScanResult
+from wechat_decrypt_tool.macos_db_key_helper import (
+    MacosDbKeyReloginRequiredError,
+    MacosDbKeyUnavailableError,
+)
 from wechat_decrypt_tool.path_fix import PathFixRequest
 from wechat_decrypt_tool.routers import keys as keys_router
 
@@ -86,9 +90,12 @@ class TestMacosPlatformSupport(unittest.TestCase):
             manifest.write_text(
                 json.dumps(
                     {
-                        "schemaVersion": 2,
-                        "buildId": "dev-local",
-                        "developmentBuild": True,
+                        "schemaVersion": 3,
+                        "platform": "macos",
+                        "buildId": "wcdb-macos-source-public-fixture",
+                        "developmentBuild": False,
+                        "sourceRuntime": True,
+                        "macosHostVerification": "same-user-direct-parent",
                     }
                 ),
                 encoding="utf-8",
@@ -164,6 +171,54 @@ class TestMacosPlatformSupport(unittest.TestCase):
         self.assertEqual(workflow.call_args.kwargs["key_mode"], "macos_private_helper")
         self.assertIsNotNone(workflow.call_args.kwargs["cancel_event"])
 
+    def test_database_key_endpoint_always_recaptures_on_macos(self) -> None:
+        class ConnectedRequest:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        with (
+            patch.object(keys_router, "is_macos", return_value=True),
+            patch.object(keys_router, "get_saved_keys") as saved,
+            patch.object(
+                keys_router,
+                "get_db_key_workflow",
+                return_value={"db_key": "ef" * 32, "method": "macos_private_helper"},
+            ) as workflow,
+        ):
+            result = asyncio.run(
+                keys_router.get_wechat_db_key(
+                    ConnectedRequest(),
+                    db_storage_path="/tmp/wxid_demo_1a2b/db_storage",
+                )
+            )
+
+        self.assertEqual(result["status"], 0)
+        self.assertEqual(result["data"]["db_key"], "ef" * 32)
+        self.assertEqual(result["data"]["method"], "macos_private_helper")
+        saved.assert_not_called()
+        workflow.assert_called_once()
+
+    def test_database_key_endpoint_explains_when_wechat_must_relogin(self) -> None:
+        class ConnectedRequest:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        with (
+            patch.object(keys_router, "is_macos", return_value=True),
+            patch.object(
+                keys_router,
+                "get_db_key_workflow",
+                side_effect=MacosDbKeyReloginRequiredError(),
+            ),
+        ):
+            result = asyncio.run(keys_router.get_wechat_db_key(ConnectedRequest()))
+
+        self.assertEqual(result["status"], -1)
+        self.assertEqual(result["data"]["error_code"], "WECHAT_RELOGIN_REQUIRED")
+        self.assertTrue(result["data"]["retryable"])
+        self.assertIn("60 秒内", result["errmsg"])
+        self.assertIn("重新登录", result["errmsg"])
+
     def test_macos_database_key_endpoint_redacts_unknown_internal_errors(self) -> None:
         class ConnectedRequest:
             async def is_disconnected(self) -> bool:
@@ -204,6 +259,31 @@ class TestMacosPlatformSupport(unittest.TestCase):
         self.assertEqual(result["data"]["error_code"], "TIMEOUT")
         self.assertNotIn(secret_detail, result["errmsg"])
 
+    def test_macos_database_key_endpoint_logs_only_safe_failure_classification(self) -> None:
+        class ConnectedRequest:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        secret_detail = "device-secret=/Users/private/do-not-log"
+        failure = keys_router.MacosDbKeyError(
+            secret_detail,
+            code="AUTHORIZATION_UNAVAILABLE",
+            retryable=True,
+        )
+        with (
+            patch.object(keys_router, "is_macos", return_value=True),
+            patch.object(keys_router, "get_db_key_workflow", side_effect=failure),
+            self.assertLogs(keys_router.logger, level="WARNING") as captured,
+        ):
+            result = asyncio.run(keys_router.get_wechat_db_key(ConnectedRequest()))
+
+        combined = "\n".join(captured.output)
+        self.assertEqual(result["status"], -1)
+        self.assertEqual(result["data"]["error_code"], "AUTHORIZATION_UNAVAILABLE")
+        self.assertIn("error_code=AUTHORIZATION_UNAVAILABLE", combined)
+        self.assertIn("retryable=True", combined)
+        self.assertNotIn(secret_detail, combined)
+
     def test_database_key_service_uses_only_private_helper_on_macos(self) -> None:
         with (
             patch.object(key_service, "is_macos", return_value=True),
@@ -211,6 +291,17 @@ class TestMacosPlatformSupport(unittest.TestCase):
                 "wechat_decrypt_tool.macos_db_key_helper.capture_macos_database_key",
                 return_value={"db_key": "cd" * 32, "method": "macos_private_helper"},
             ) as capture,
+            patch(
+                "wechat_decrypt_tool.wechat_decrypt.validate_realtime_database_key",
+                return_value={
+                    "valid": True,
+                    "verified_roles": ["message", "session"],
+                    "modes": {
+                        "message": "sqlcipher_passphrase",
+                        "session": "sqlcipher_passphrase",
+                    },
+                },
+            ) as validate,
             patch.object(key_service, "_get_db_key_with_v4") as memory_scan,
             patch.object(key_service, "WeChatKeyFetcher") as hook_fetcher,
         ):
@@ -221,8 +312,36 @@ class TestMacosPlatformSupport(unittest.TestCase):
 
         self.assertEqual(result["method"], "macos_private_helper")
         capture.assert_called_once()
+        validate.assert_called_once_with("/tmp/wxid_demo/db_storage", "cd" * 32)
         memory_scan.assert_not_called()
         hook_fetcher.assert_not_called()
+
+    def test_database_key_service_rejects_one_database_raw_key_on_macos(self) -> None:
+        with (
+            patch.object(key_service, "is_macos", return_value=True),
+            patch(
+                "wechat_decrypt_tool.macos_db_key_helper.capture_macos_database_key",
+                return_value={"db_key": "ef" * 32, "method": "macos_private_helper"},
+            ),
+            patch(
+                "wechat_decrypt_tool.wechat_decrypt.validate_realtime_database_key",
+                return_value={
+                    "valid": False,
+                    "verified_roles": ["message"],
+                    "modes": {"message": "raw_enc_key"},
+                    "reason": "unverified_roles:session",
+                },
+            ),
+        ):
+            with self.assertRaises(MacosDbKeyUnavailableError) as raised:
+                key_service.get_db_key_workflow(
+                    db_storage_path="/tmp/wxid_demo/db_storage",
+                    key_mode="auto",
+                )
+
+        self.assertEqual(raised.exception.code, "CAPTURE_KEY_MISMATCH")
+        self.assertTrue(raised.exception.retryable)
+        self.assertIn("重新登录", str(raised.exception))
 
     def test_macos_kvcomm_candidates_follow_weflow_data_layouts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

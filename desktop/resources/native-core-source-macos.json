@@ -1,12 +1,11 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "platform": "darwin",
   "architecture": "arm64",
-  "artifactName": "wechatdb-native-macos-arm64-development",
-  "producerRepository": "2977094657/WCDB",
-  "producerWorkflow": ".github/workflows/macos-native-production.yml",
-  "producerWorkflowRunId": 30889464728,
-  "producerWorkflowRunAttempt": 1,
-  "sourceRevision": "d54688b2ea12d6cf25858ff3e41d7f6a1fb98f9f",
-  "checksumsSha256": "c656a5f5292a9106453fdea55a331c57d5e396d17618454a27dfa13e5cc9aa41"
+  "publisherRepository": "LifeArchiveProject/WeChatDataAnalysis",
+  "releaseTag": "macos-source-runtime-20260805-4519ec45-ad38ae9c",
+  "assetName": "wechatdataanalysis-macos-source-runtime-arm64-v1.tar.gz",
+  "assetSha256": "b5648f6b0efb1d0356161932628a8370e4fffeab8d9b490b0dfaaa0a0a586a9e",
+  "runtimeManifestSha256": "9d2aad775ebf254c217ca427eb6d59f99989aabd1990047fd28e7f406a79f497",
+  "expiresAtUnix": 1789718652
 }

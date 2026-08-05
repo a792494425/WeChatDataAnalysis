@@ -117,17 +117,37 @@ def test_macos_database_key_uses_the_bundled_authorized_helper_without_external_
 
     assert "key_mode: 'macos_private_helper'" in source
     assert "platformCapabilities.value?.database_key_extraction !== true" in source
-    assert "正在验证本地组件并完成联网安全校验" in source
+    assert "捕获已开始" in source
+    assert "60 秒内仅退出当前账号并重新登录" in source
     assert "数据库解密密钥已通过 macOS 本地受控组件获取成功" in source
     assert "打开 WeFlow 项目页" not in source
     assert "https://github.com/hicccc77/WeFlow" not in source
     assert "查看 Mac 获取方式" not in source
 
 
+def test_macos_database_key_clears_prefill_and_always_starts_real_capture():
+    source = read_decrypt_page()
+
+    handler = source.index("const handleGetDbKey = async () =>")
+    clear_key = source.index("formData.key = ''", handler)
+    request = source.index("const requestRevision = ++dbKeyRequestRevision", handler)
+    assert clear_key < request
+    assert "const existingDbKey" not in source[handler:request]
+    assert "saved_db_key" not in source[handler:request]
+
+
+def test_saved_database_key_prefill_remains_available_before_macos_recapture():
+    source = read_decrypt_page()
+
+    assert "if (imageKeyContextStillSelected(context) && dbKey" in source
+    assert "if (!isMacos.value && imageKeyContextStillSelected(context)" not in source
+    assert "const cachedPair = normalizeCompleteImageKeys(xorKey, aesKey)" in source
+
+
 def test_db_key_persistence_failure_warns_without_blocking_image_key_step():
     source = read_decrypt_page()
 
-    warning = "数据库已解密，但密钥未能保存；修复数据目录权限并重新解密后才能使用实时消息。"
+    warning = "数据库密钥未通过完整实时库校验或无法安全保存；请重新获取并确认主要数据库解密成功，仍失败请检查数据目录权限。"
     assert warning in source
     assert "if (result?.db_key_persisted !== false) return" in source
     assert source.count("showDbKeyPersistenceWarning(") == 2
