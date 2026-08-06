@@ -1,7 +1,7 @@
 {
   "name": "wechat-data-analysis-desktop",
   "private": true,
-  "version": "1.18.5",
+  "version": "2.0.1",
   "main": "src/main.cjs",
   "scripts": {
     "dev": "node scripts/dev.cjs",
@@ -78,6 +78,7 @@
         "from": "resources/signing",
         "to": "signing",
         "filter": [
+          "macos-private-pki-root.cer",
           "windows-private-pki-root.cer",
           "windows-private-pki.ps1"
         ]

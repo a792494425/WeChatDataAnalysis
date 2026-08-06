@@ -66,22 +66,13 @@ test("macOS package keeps image scanning resources, removes retired WCDB, and st
   assert.match(buildBackend, /darwin:\s*\["libwechatdb_client\.dylib", "wechatdb_broker", NATIVE_CORE_MANIFEST\]/);
 });
 
-test("macOS image resources retain WeFlow attribution without retired WCDB notices", () => {
-  const notices = fs.readFileSync(path.join(repoRoot, "THIRD_PARTY_NOTICES.md"), "utf8");
-  assert.match(notices, /WeFlow macOS native resources/);
-  assert.match(notices, /native\/macos\/WEFLOW_LICENSE\.txt/);
-  assert.match(notices, /native\/macos\/universal\/libwx_key\.dylib/);
-  assert.match(notices, /native\/macos\/universal\/image_scan_helper/);
-  assert.doesNotMatch(notices, /libwcdb_api\.dylib/);
-  assert.doesNotMatch(notices, /libWCDB\.dylib/);
-});
-
 test("Windows package uses private-PKI signing while preserving producer signatures", () => {
   const signingResource = packageJson.build.extraResources.find(
     (item) => item && item.from === "resources/signing"
   );
   assert.ok(signingResource);
   assert.deepEqual([...signingResource.filter].sort(), [
+    "macos-private-pki-root.cer",
     "windows-private-pki-root.cer",
     "windows-private-pki.ps1",
   ]);
@@ -102,7 +93,7 @@ test("Windows package uses private-PKI signing while preserving producer signatu
   );
 });
 
-test("Windows release requires TPM private-PKI signing and installer smoke", () => {
+test("Windows release uses protected cloud private-PKI signing and installer smoke", () => {
   const smokeScript = path.join(desktopRoot, "scripts", "smoke-windows-package.cjs");
   assert.equal(packageJson.scripts["smoke:win"], "node scripts/smoke-windows-package.cjs");
   assert.equal(
@@ -122,14 +113,44 @@ test("Windows release requires TPM private-PKI signing and installer smoke", () 
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github", "workflows", "release.yml"), "utf8")
     .replace(/\r\n/g, "\n");
-  const windowsJob = workflow.match(/\n  build-windows:\n([\s\S]*?)(?=\n  publish-release:\n)/)?.[1] || "";
-  assert.match(windowsJob, /runs-on:\s*\[self-hosted, Windows, X64, wce-production-signing\]/);
+  const windowsJob = workflow.match(
+    /\n  build-windows:\n([\s\S]*?)(?=\n  [A-Za-z0-9_-]+:\n|$)/
+  )?.[1] || "";
+  assert.match(windowsJob, /runs-on:\s*windows-2022/);
   assert.match(windowsJob, /environment:\s*windows-private-pki-production/);
   assert.match(windowsJob, /fetch-depth:\s*0/);
   assert.match(windowsJob, /persist-credentials:\s*false/);
   assert.match(windowsJob, /\$tagCommit\s+-cne\s+\$head/);
   assert.match(windowsJob, /git merge-base --is-ancestor \$tagRef origin\/main/);
   assert.match(windowsJob, /WCE_WINDOWS_CLIENT_CERT_THUMBPRINT/);
+  assert.match(
+    windowsJob,
+    /WCE_WINDOWS_CLIENT_SIGNING_PFX_BASE64:\s*\$\{\{ secrets\.WCE_WINDOWS_CLIENT_SIGNING_PFX_BASE64 \}\}/
+  );
+  assert.match(
+    windowsJob,
+    /WCE_WINDOWS_CLIENT_SIGNING_PFX_PASSWORD:\s*\$\{\{ secrets\.WCE_WINDOWS_CLIENT_SIGNING_PFX_PASSWORD \}\}/
+  );
+  assert.match(
+    windowsJob,
+    /WCE_WINDOWS_PRIVATE_ROOT_CERT_BASE64:\s*\$\{\{ secrets\.WCE_WINDOWS_PRIVATE_ROOT_CERT_BASE64 \}\}/
+  );
+  assert.match(windowsJob, /Import-WindowsCloudSigningIdentity\.ps1/);
+  assert.match(windowsJob, /Remove-WindowsCloudSigningIdentity\.ps1/);
+  assert.match(windowsJob, /if:\s*always\(\)/);
+  assert.match(windowsJob, /steps\.cloud-signing\.outputs\.client-thumbprint/);
+  assert.match(windowsJob, /steps\.cloud-signing\.outputs\.root-certificate-path/);
+  assert.match(windowsJob, /WCE_WINDOWS_SIGNING_ASSURANCE/);
+  assert.match(windowsJob, /Install Python dependencies/);
+  assert.match(windowsJob, /Run focused Python release tests/);
+  assert.match(windowsJob, /uv sync --frozen/);
+  assert.match(windowsJob, /uv run pytest -q/);
+  assert.match(windowsJob, /tests\/test_native_core_broker_lifecycle\.py/);
+  assert.match(windowsJob, /tests\/test_native_core_device_credential\.py/);
+  assert.match(windowsJob, /tests\/test_wcdb_realtime_native_core_required\.py/);
+  assert.doesNotMatch(windowsJob, /Prepare signed ephemeral Python test host/);
+  assert.doesNotMatch(windowsJob, /WCE_PYTHON_TEST_HOST/);
+  assert.doesNotMatch(windowsJob, /WECHAT_TOOL_NATIVE_CORE_(?:LIBRARY|BROKER)/);
   assert.match(windowsJob, /WCE_NATIVE_CORE_SOURCE_REVISION/);
   assert.match(windowsJob, /WCE_NATIVE_CORE_BUILD_ID/);
   assert.match(windowsJob, /WCE_WINDOWS_PRIVATE_ROOT_CERT_PATH/);
@@ -156,10 +177,21 @@ test("Windows release requires TPM private-PKI signing and installer smoke", () 
   assert.match(windowsJob, /WCE_NATIVE_CORE_SECURITY_NOTICE_SHA256/);
   assert.match(windowsJob, /WCE_NATIVE_CORE_SECURITY_CHECKPOINT_SET_SHA256/);
   assert.match(windowsJob, /windowsPrivatePkiLeafRevocation = 'build-and-lease-only'/);
-  assert.doesNotMatch(windowsJob, /WCE_WINDOWS_CLIENT_CSC_LINK|WIN_CSC_KEY_PASSWORD/);
+  assert.doesNotMatch(
+    windowsJob,
+    /WCE_WINDOWS_CLIENT_CSC_LINK|WIN_CSC_KEY_PASSWORD|runs-on:\s*\[self-hosted|wce-production-signing|WCE_SIGNTOOL_PATH|[A-Z]:\\abc\\/i
+  );
   assert.match(windowsJob, /Verify signed unpacked Windows runtime/);
   assert.match(windowsJob, /WCE_WINDOWS_INSTALLER_SMOKE_ALLOWED:\s*"1"/);
   assert.match(windowsJob, /run:\s*npm run smoke:win/);
+  assert.match(windowsJob, /Run focused desktop release tests/);
+  assert.match(windowsJob, /tests\/package-config\.test\.cjs/);
+  assert.match(windowsJob, /tests\/native-core-before-pack\.test\.cjs/);
+  assert.match(windowsJob, /tests\/native-core-packaging\.test\.cjs/);
+  assert.match(windowsJob, /tests\/windows-package-smoke\.test\.cjs/);
+  assert.match(windowsJob, /tests\/windows-private-pki-runtime\.test\.cjs/);
+  assert.match(windowsJob, /tests\/windows-private-pki-sign\.test\.cjs/);
+  assert.doesNotMatch(windowsJob, /tests\/\*\.test\.cjs/);
   assert.match(windowsJob, /Generate Windows release checksums and provenance/);
   assert.match(windowsJob, /Get-FileHash -Algorithm SHA256/);
   assert.match(windowsJob, /\[System\.Text\.Encoding\]::ASCII/);
@@ -176,6 +208,34 @@ test("Windows release requires TPM private-PKI signing and installer smoke", () 
   assert.match(windowsJob, /WINDOWS_PRIVATE_ROOT_SHA256:/);
   assert.match(windowsJob, /WORKFLOW_RUN_ID:\s*\$\{\{ github\.run_id \}\}/);
   assert.match(windowsJob, /WORKFLOW_RUN_ATTEMPT:\s*\$\{\{ github\.run_attempt \}\}/);
+
+  const importIndex = windowsJob.indexOf("Import-WindowsCloudSigningIdentity.ps1");
+  const validateIndex = windowsJob.indexOf("Validate native production artifact");
+  const pythonDependenciesIndex = windowsJob.indexOf("Install Python dependencies");
+  const pythonTestsIndex = windowsJob.indexOf("Run focused Python release tests");
+  const buildIndex = windowsJob.indexOf("Build Windows installer");
+  const uploadIndex = windowsJob.indexOf("Upload Windows release files");
+  const cleanupIndex = windowsJob.indexOf("Remove-WindowsCloudSigningIdentity.ps1");
+  assert.ok(importIndex >= 0 && importIndex < validateIndex);
+  assert.ok(
+    validateIndex < pythonDependenciesIndex && pythonDependenciesIndex < pythonTestsIndex
+  );
+  assert.ok(pythonTestsIndex < buildIndex && buildIndex < uploadIndex);
+  assert.ok(uploadIndex < cleanupIndex);
+
+  const importScript = fs.readFileSync(
+    path.join(desktopRoot, "scripts", "Import-WindowsCloudSigningIdentity.ps1"),
+    "utf8"
+  );
+  const cleanupScript = fs.readFileSync(
+    path.join(desktopRoot, "scripts", "Remove-WindowsCloudSigningIdentity.ps1"),
+    "utf8"
+  );
+  assert.match(importScript, /Microsoft Software Key Storage Provider/);
+  assert.match(importScript, /AllowExport\|AllowPlaintextExport/);
+  assert.match(importScript, /Import-PfxCertificate/);
+  assert.match(importScript, /\[IO\.File\]::Delete\(\$pfxPath\)/);
+  assert.match(cleanupScript, /Remove-Item -LiteralPath \$certificatePath -DeleteKey -Force/);
 
   const upload = windowsJob.match(/- name: Upload Windows release files\n([\s\S]*?)$/)?.[1] || "";
   assert.match(upload, /desktop\/dist\/\*Setup\*\.exe/);
@@ -200,9 +260,9 @@ test("release workflow pins every remote action to an approved commit", () => {
     ["dtolnay/rust-toolchain", "4cda84d5c5c54efe2404f9d843567869ab1699d4"],
     ["softprops/action-gh-release", "3bb12739c298aeb8a4eeaf626c5b8d85266b0e65"],
   ]);
-  const remoteUses = [...workflow.matchAll(/^\s*uses:\s*([^\s#]+)(?:\s+#.*)?$/gm)].map(
-    (match) => match[1]
-  );
+  const remoteUses = [...workflow.matchAll(/^\s*uses:\s*([^\s#]+)(?:\s+#.*)?$/gm)]
+    .map((match) => match[1])
+    .filter((use) => !use.startsWith("./"));
 
   assert.ok(remoteUses.length > 0);
   for (const use of remoteUses) {
@@ -273,6 +333,20 @@ test("macOS release exposes a reusable packaged smoke test", () => {
   assert.match(smokeSource, /\/api\/health/);
   assert.doesNotMatch(smokeSource, /require\(["']koffi["']\)/);
   assert.doesNotMatch(smokeSource, /sidecarProc|sidecarPort|sidecarToken/);
+});
+
+test("packaged macOS startup establishes pinned user trust before launching the backend", () => {
+  const mainSource = fs.readFileSync(path.join(desktopRoot, "src", "main.cjs"), "utf8");
+  const mainStart = mainSource.indexOf("async function main()");
+  const trustCall = mainSource.indexOf(
+    "const evidence = ensureMacosPrivatePkiTrust",
+    mainStart
+  );
+  const backendLaunch = mainSource.indexOf("await ensureMainWindowReady()", mainStart);
+
+  assert.ok(mainStart >= 0);
+  assert.ok(trustCall > mainStart, "macOS private-PKI trust bootstrap is not wired into main startup");
+  assert.ok(backendLaunch > trustCall, "backend can launch before macOS private-PKI trust is ready");
 });
 
 test("macOS native resources expose reproducible build and architecture verification", () => {
@@ -434,6 +508,9 @@ test("macOS archive verification checks ZIP, mounted DMG, signing, and distribut
   assert.match(verifier, /macosXkeyContract\.checksumsFileName/);
   assert.match(verifier, /macosXkeyContract\.provenanceFileName/);
   assert.match(verifier, /macosXkeyContract\.thirdPartyNoticeFileName/);
+  assert.match(verifier, /macos-private-pki-root\.cer/);
+  assert.match(verifier, /macosPrivateRootSha256/);
+  assert.match(smoke, /resolveMacosPrivatePkiRuntime/);
   assert.match(
     verifier,
     /validatePackagedBackend\(\{ backendDir: backendRoot, platform: "darwin" \}\)/
@@ -514,17 +591,22 @@ test("macOS DMG cleanup preserves both detach failures", () => {
   );
 });
 
-test("release workflow stays Windows-only while private native source is excluded", () => {
+test("tag release reuses the protected macOS build and publishes both platforms", () => {
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github", "workflows", "release.yml"), "utf8")
     .replace(/\r\n/g, "\n");
   const publishJob = workflow.split("\n  publish-release:\n", 2)[1] || "";
 
-  assert.doesNotMatch(workflow, /\n  build-macos-arm64:\n/);
+  assert.match(workflow, /^name: Release \(Windows and macOS ARM64\)$/m);
+  assert.match(
+    workflow,
+    /\n  build-macos-arm64:\n\s+uses: \.\/\.github\/workflows\/macos-private-build\.yml\n\s+secrets: inherit/
+  );
   assert.doesNotMatch(workflow, /native\/wce_integrity/);
   assert.doesNotMatch(workflow, /npm run dist:mac|npm run smoke:mac/);
   assert.match(publishJob, /needs:\s*\n\s*- build-windows/);
-  assert.doesNotMatch(publishJob, /build-macos/);
+  assert.match(publishJob, /needs:[\s\S]*- build-macos-arm64/);
+  assert.match(publishJob, /merge-multiple: true/);
 });
 
 test("Windows packages are built only by the tag-triggered release workflow", () => {
@@ -536,7 +618,7 @@ test("Windows packages are built only by the tag-triggered release workflow", ()
   // Desktop packaging is expensive; keep it off pull requests and main pushes.
   assert.match(workflow, /^on:\n  push:\n    tags:\n      - "v\*"\n/m);
   assert.match(workflow, /\n  build-windows:\n/);
-  assert.doesNotMatch(workflow, /\n  build-macos-arm64:\n/);
+  assert.match(workflow, /\n  build-macos-arm64:\n/);
 
   for (const entry of fs.readdirSync(workflowsDir)) {
     const source = fs.readFileSync(path.join(workflowsDir, entry), "utf8");

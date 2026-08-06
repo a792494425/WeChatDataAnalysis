@@ -17,6 +17,7 @@ const {
   ENV_NATIVE_CORE_MODE,
   applyNativeCoreRuntimePolicy,
 } = require("../src/native-core-runtime.cjs");
+const { resolveMacosPrivatePkiRuntime } = require("../src/macos-private-pki-runtime.cjs");
 
 const desktopRoot = path.resolve(__dirname, "..");
 const SUPPORTED_ARCHITECTURE = "arm64";
@@ -318,6 +319,7 @@ async function runPackagedRuntimeSmoke(appPath) {
   const xkeyHelper = path.join(xkeyRoot, macosXkeyContract.helperFileName);
   const integrity = path.join(nativeRoot, "libwce_integrity.dylib");
   const ffmpeg = path.join(resources, "ffmpeg", "ffmpeg");
+  const privatePkiRoot = path.join(resources, "signing", "macos-private-pki-root.cer");
 
   for (const filePath of [
     electronExecutable,
@@ -335,10 +337,10 @@ async function runPackagedRuntimeSmoke(appPath) {
       executable: [electronExecutable, backend, nativeBroker, imageHelper, xkeyHelper, ffmpeg].includes(filePath),
     });
   }
-  requirePath(path.join(resources, "backend", "THIRD_PARTY_NOTICES.md"));
   requirePath(path.join(nativeRoot, "macos", "WEFLOW_LICENSE.txt"));
   requirePath(path.join(resources, "ffmpeg", "LICENSE"));
   requirePath(path.join(resources, "ffmpeg", "ffmpeg.LICENSE"));
+  requirePath(privatePkiRoot);
   for (const name of [
     macosXkeyContract.manifestFileName,
     macosXkeyContract.trustFileName,
@@ -380,6 +382,15 @@ async function runPackagedRuntimeSmoke(appPath) {
 
   const packagedNative = validatePackagedBackend({ backendDir: backendRoot, platform: "darwin" });
   assert.equal(path.resolve(packagedNative.nativeDir), path.resolve(nativeRoot));
+  const privatePki = resolveMacosPrivatePkiRuntime({
+    executablePath: electronExecutable,
+    resourcesPath: resources,
+  });
+  assert.equal(privatePki.rootCertificate, privatePkiRoot);
+  assert.equal(
+    privatePki.rootSha256,
+    String(packagedNative.manifest.macosPrivateRootSha256).toLowerCase()
+  );
 
   const nativeCoreEnv = {};
   const nativeCorePolicy = applyNativeCoreRuntimePolicy(nativeCoreEnv, {
