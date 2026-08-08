@@ -1955,11 +1955,19 @@ function getNativeCoreRuntimeDir(env = process.env) {
   // fallback for direct `electron .` and dev:static source launches.
   if (
     !app.isPackaged &&
-    process.platform === "darwin" &&
     (
-      !String(env[ENV_SOURCE_NATIVE_CORE_DIR] || "").trim() ||
-      !String(env[ENV_MACOS_DB_KEY_BUNDLE] || "").trim() ||
-      !String(env[ENV_INTEGRITY_NATIVE_PATH] || "").trim()
+      (
+        process.platform === "darwin" &&
+        (
+          !String(env[ENV_SOURCE_NATIVE_CORE_DIR] || "").trim() ||
+          !String(env[ENV_MACOS_DB_KEY_BUNDLE] || "").trim() ||
+          !String(env[ENV_INTEGRITY_NATIVE_PATH] || "").trim()
+        )
+      ) ||
+      (
+        process.platform === "win32" &&
+        !String(env[ENV_SOURCE_NATIVE_CORE_DIR] || "").trim()
+      )
     )
   ) {
     const sourceNativeCore = ensureSourceNativeCore({ env });
@@ -2016,8 +2024,9 @@ function startBackend() {
     WECHAT_TOOL_PORT: String(getBackendPort()),
     WECHAT_TOOL_DATA_DIR: resolvedDataPath,
     WECHAT_TOOL_OUTPUT_DIR: resolvedOutputPath,
-    // Make sure Python prints UTF-8 to stdout/stderr.
-    PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8",
+    // Electron decodes the backend pipe as UTF-8. Do not inherit an ambient
+    // Windows code page such as cp950, which cannot encode Simplified Chinese.
+    PYTHONIOENCODING: "utf-8",
   };
   configureNativeCoreRuntime(env);
   clearLegacyWcdbEnvironment(env);

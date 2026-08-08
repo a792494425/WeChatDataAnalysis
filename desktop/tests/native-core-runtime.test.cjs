@@ -61,6 +61,12 @@ const DEVELOPMENT_MANIFEST = Object.freeze({
   securityCheckpointSetSha256: "bb".repeat(32),
 });
 
+const WINDOWS_SOURCE_PUBLIC_MANIFEST = Object.freeze({
+  ...PRODUCTION_MANIFEST,
+  sourceRuntime: true,
+  windowsHostVerification: "same-user-direct-parent",
+});
+
 const MACOS_PRODUCTION_MANIFEST = Object.freeze({
   schemaVersion: 3,
   platform: "macos",
@@ -372,7 +378,7 @@ test("source and packaged artifact profiles cannot be swapped", () => {
         nativeDir: productionDir,
         platform: "win32",
       }),
-      /requires the exact dev-local/
+      /requires the exact restricted source-public or dev-local/
     );
     assert.throws(
       () => applyNativeCoreRuntimePolicy({}, {
@@ -385,6 +391,33 @@ test("source and packaged artifact profiles cannot be swapped", () => {
   } finally {
     cleanup(productionDir);
     cleanup(developmentDir);
+  }
+});
+
+test("Windows source-public artifacts are accepted only by source checkouts", () => {
+  const sourceDir = makeArtifacts("win32", WINDOWS_SOURCE_PUBLIC_MANIFEST);
+  try {
+    const policy = applyNativeCoreRuntimePolicy({}, {
+      isPackaged: false,
+      nativeDir: sourceDir,
+      platform: "win32",
+    });
+    assert.equal(policy.artifactState, "source-public");
+    assert.equal(policy.reason, "source-public-artifacts");
+    assert.equal(policy.enableDevelopmentOverride, false);
+    assert.equal(isSourcePublicNativeCoreManifest(WINDOWS_SOURCE_PUBLIC_MANIFEST), true);
+    assert.equal(isProductionNativeCoreManifest(WINDOWS_SOURCE_PUBLIC_MANIFEST), false);
+    assert.throws(
+      () => resolveNativeCoreRuntimePolicy({
+        env: {},
+        isPackaged: true,
+        nativeDir: sourceDir,
+        platform: "win32",
+      }),
+      /requires an approved production/
+    );
+  } finally {
+    cleanup(sourceDir);
   }
 });
 
@@ -509,6 +542,8 @@ test("desktop startBackend clears legacy WCDB state and never starts the sidecar
   const startBackend = mainSource.match(/function startBackend\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
   assert.match(startBackend, /configureNativeCoreRuntime\(env\)/);
   assert.match(startBackend, /clearLegacyWcdbEnvironment\(env\)/);
+  assert.match(startBackend, /PYTHONIOENCODING:\s*"utf-8"/);
+  assert.doesNotMatch(startBackend, /PYTHONIOENCODING:\s*process\.env\.PYTHONIOENCODING/);
   assert.doesNotMatch(startBackend, /startWcdbSidecar\(/);
   assert.doesNotMatch(startBackend, /ensureWcdbSidecarEnv\(/);
   assert.doesNotMatch(startBackend, /WECHAT_TOOL_WCDB_API_DLL_PATH\s*=/);

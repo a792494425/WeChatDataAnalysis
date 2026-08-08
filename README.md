@@ -112,29 +112,6 @@
 
 > Excel 格式生成 `.xlsx` 文件；聊天记录、朋友圈和收藏会将对应格式文件与必要资源一起打包为 ZIP。
 
-## Windows / macOS 兼容性
-
-| 功能 | Windows | macOS |
-| --- | --- | --- |
-| 数据库密钥自动获取 | 支持 | Apple Silicon 支持；获取时需要联网校验，并可能需要辅助功能权限 |
-| 数据库解密与离线分析 | 支持 | 支持 |
-| 图片密钥内存扫描 | 支持 | 支持；首次使用可能需要授予辅助功能或管理员权限 |
-| WCDB 实时消息、联系人和朋友圈 | 支持 | Apple Silicon 支持；Intel Mac 暂不支持实时 WCDB |
-| 聊天、朋友圈、联系人、收藏等导出 | 支持 | 支持 |
-| 账号全量归档 ZIP 导入与导出 | 支持 | 支持，并可与 Windows 双向迁移 |
-| 微信进程大图 Hook | 支持 | 不提供，这是 Windows 专属能力 |
-
-Apple Silicon Mac 可以通过随 WCDA 运行时交付的受限本地组件获取您当前登录微信账号的数据库密钥。密钥获取需要联网完成实时安全校验；已缓存数据库的查询、搜索、翻页和导出可在当前原生运行时的固定 45 天有效期内离线使用。Intel Mac 暂不支持实时 WCDB。
-
-### 从 Windows 迁移到 Mac
-
-1. 在 Windows 端打开全局导出，选择“账号数据归档”，同时包含数据库和资源文件。
-2. 将生成的 `wechat_archive_*.zip` 传到 Mac，不要手动解压或修改归档内容。
-3. 在 Mac 端进入“导入数据”，选择“账号归档 ZIP”，预览账号后确认导入。
-4. 导入器会校验每个文件的 SHA-256；若本地已有同名账号，会在完整导入成功后保留旧目录备份。
-
-已经由本项目解密并归档的数据，迁移后可直接离线查看；连接 Mac 上微信原始 WCDB 时，可由应用在获得系统权限并完成联网校验后自动获取数据库密钥，也仍可手动填写密钥。
-
 ## 加入群聊
 
 也欢迎加入下方 QQ 群一起讨论。
@@ -192,16 +169,18 @@ npm ci
 
 #### 2.5 启动服务
 
-Apple Silicon macOS 建议直接启动完整桌面开发模式：
+Windows x64 与 Apple Silicon macOS 都应直接启动完整桌面开发模式：
 
 ```bash
 cd desktop
 npm run dev
 ```
 
-首次启动会通过公开 HTTPS 从本仓库固定 Release 下载约 42 MiB 的受限 macOS 运行时，并在校验归档 SHA-256、内部文件清单、签名配置和 45 天有效期后缓存到 `~/Library/Caches/WeChatDataAnalysis/source-native-core`。这一过程不需要 GitHub CLI、GitHub 账号、Token 或私有 Producer 仓库权限。固定运行时过期后执行 `git pull` 获取新的公开固定版本；程序不会接受过期、被修改或类型不匹配的缓存。
+首次启动会通过公开 HTTPS 从本仓库固定 Release 下载对应平台的受限原生运行时，并在校验归档 SHA-256、内部文件清单、签名配置和 45 天有效期后缓存。macOS 缓存位于 `~/Library/Caches/WeChatDataAnalysis/source-native-core`，Windows 缓存位于 `%LOCALAPPDATA%\WeChatDataAnalysis\source-native-core`。这一过程不需要 GitHub CLI、GitHub 账号、Token 或私有 Producer 仓库权限。固定运行时过期后执行 `git pull` 获取新的公开固定版本；程序不会接受过期、被修改或平台不匹配的缓存。
 
-Windows 或仅启动 Web 开发环境时，也可以分别启动后端和前端：
+`src/wechat_decrypt_tool/native/` 下的 DLL、Broker 和 manifest 被 `.gitignore` 排除是预期设计：源码启动器会把经过固定摘要验证的制品放入用户缓存并通过受控环境变量交给后端，不会把私有 native-core 源码或可误提交的二进制直接放进 Git 工作树。
+
+仅开发不依赖实时数据库的 Web 界面时，也可以分别启动后端和前端。该方式不会执行桌面端原生运行时预检，不应用于验证实时聊天读取：
 
 #### 启动后端API服务
 ```bash
