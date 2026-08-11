@@ -259,6 +259,7 @@ test("release workflow pins every remote action to an approved commit", () => {
     ["actions/upload-artifact", "ea165f8d65b6e75b540449e92b4886f43607fa02"],
     ["dtolnay/rust-toolchain", "4cda84d5c5c54efe2404f9d843567869ab1699d4"],
     ["softprops/action-gh-release", "3bb12739c298aeb8a4eeaf626c5b8d85266b0e65"],
+    ["H3CoF6/qq-notify-action", "50d180981e7c7b8552a3331b981e3f8cfcf40c44"],
   ]);
   const remoteUses = [...workflow.matchAll(/^\s*uses:\s*([^\s#]+)(?:\s+#.*)?$/gm)]
     .map((match) => match[1])
@@ -476,7 +477,7 @@ test("unsigned macOS CI packages are ad-hoc sealed before DMG creation", () => {
   assert.match(afterPack, /MACOS_DISTRIBUTION_BUILD/);
 });
 
-test("macOS signing keeps debugger entitlement on the image helper only", () => {
+test("macOS signing keeps debugger entitlement off the app and on capture helpers", () => {
   const appEntitlements = fs.readFileSync(path.join(desktopRoot, "entitlements.mac.plist"), "utf8");
   const helperEntitlements = fs.readFileSync(
     path.join(repoRoot, "src", "wechat_decrypt_tool", "native", "macos", "source", "image_scan_entitlements.plist"),
@@ -510,6 +511,9 @@ test("macOS archive verification checks ZIP, mounted DMG, signing, and distribut
   assert.match(verifier, /macosXkeyContract\.thirdPartyNoticeFileName/);
   assert.match(verifier, /macos-private-pki-root\.cer/);
   assert.match(verifier, /macosPrivateRootSha256/);
+  assert.match(verifier, /\["-d", "--entitlements", ":-", xkeyHelper\]/);
+  assert.match(verifier, /assert\.match\(xkeyEntitlements, \/com\\\.apple\\\.security\\\.cs\\\.debugger\//);
+  assert.match(smoke, /\["-d", "--entitlements", ":-", xkeyHelper\]/);
   assert.match(smoke, /resolveMacosPrivatePkiRuntime/);
   assert.match(
     verifier,
