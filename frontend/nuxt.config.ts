@@ -1,8 +1,19 @@
 // https://nuxt.com/docs/api/configuration/nuxt-config
+import {
+  FIRST_USE_AGREEMENT_STORAGE_KEY,
+  FIRST_USE_AGREEMENT_VERSION,
+} from './lib/first-use-agreement'
+import { createFirstUseBootstrapScript } from './lib/first-use-bootstrap-script'
+
 const frontendHost = String(process.env.NUXT_HOST || '').trim()
 const frontendPort = Number.parseInt(String(process.env.NUXT_PORT || process.env.PORT || '3000').trim(), 10)
 const backendPort = String(process.env.WECHAT_TOOL_PORT || '10392').trim() || '10392'
 const devProxyTarget = `http://127.0.0.1:${backendPort}/api`
+const firstUseBootstrapScript = createFirstUseBootstrapScript({
+  storageKey: FIRST_USE_AGREEMENT_STORAGE_KEY,
+  version: FIRST_USE_AGREEMENT_VERSION,
+  countdownMilliseconds: 20_000,
+})
 
 export default defineNuxtConfig({
   compatibilityDate: '2025-07-15',
@@ -42,6 +53,7 @@ export default defineNuxtConfig({
   
   // 应用配置
   css: [
+    '@fortawesome/fontawesome-free/css/all.min.css',
     '~/assets/css/chat.css',
     '~/assets/css/record-pages.css',
     '~/assets/css/export-panels.css'
@@ -56,9 +68,15 @@ export default defineNuxtConfig({
         { name: 'viewport', content: 'width=device-width, initial-scale=1' },
         { name: 'description', content: '微信4.x版本数据库解密工具' }
       ],
+      script: [
+        {
+          key: 'first-use-bootstrap',
+          innerHTML: firstUseBootstrapScript,
+          tagPosition: 'head',
+        }
+      ],
       link: [
-        { rel: 'icon', type: 'image/png', href: '/logo.png' },
-        { rel: 'stylesheet', href: 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css' }
+        { rel: 'icon', type: 'image/png', href: '/logo.png' }
       ]
     }
   },
