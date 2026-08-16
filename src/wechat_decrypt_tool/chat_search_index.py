@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from .account_identity import resolve_account_self_rowid
 from .chat_helpers import (
     _decode_sqlite_text,
     _quote_ident,
@@ -198,17 +199,29 @@ def _latest_decrypted_source_mtime(account_dir: Path) -> tuple[int, str]:
     latest_mtime_ns = 0
     latest_path = ""
     for path in paths:
-        # SQLite can keep committed changes in a WAL without updating the main
-        # database file. The SHM file is intentionally excluded because reads
-        # can update it and would make a valid index look stale.
-        for candidate in (path, Path(f"{path}-wal")):
-            try:
-                mtime_ns = int(candidate.stat().st_mtime_ns)
-            except (FileNotFoundError, OSError):
-                continue
-            if mtime_ns > latest_mtime_ns:
-                latest_mtime_ns = mtime_ns
-                latest_path = str(candidate)
+        # 只看主库文件的 mtime。-wal / -shm 都不算数：
+        #
+        # 这两个边车文件会因为**读**而被改动——SQLite 在最后一个连接关闭时会自动
+        # checkpoint，把 WAL 回写并重置它；实时同步、搜索、导出每碰一次这些库都会
+        # 刷新 -wal 的 mtime。一旦把它算进「源数据是否更新」，一个刚建好的索引会在
+        # 下一次读库之后立刻被判定为过期，而 discard_stale_chat_search_index 会把
+        # 索引文件**直接删除**——用户看到的就是「明明构建过了，年度总结还说没构建」。
+        #
+        # 实测（2026-08-14 用户日志）：
+        #   Discarded stale chat search index: source_latest=.../message_1.db-wal
+        # 一个 1.3 GB、118 万条消息的完整索引就是这样被删掉的。
+        #
+        # 代价：若有新数据只提交进 WAL 而尚未 checkpoint，主库 mtime 不变，索引会被
+        # 当作仍然新鲜，年度总结的统计会短暂落后到下一次 checkpoint。这个代价远小于
+        # 误删整个索引——解密/同步流程重写分片时主库 mtime 一定会变，真正的「源数据
+        # 换了」仍然能被抓到。
+        try:
+            mtime_ns = int(path.stat().st_mtime_ns)
+        except (FileNotFoundError, OSError):
+            continue
+        if mtime_ns > latest_mtime_ns:
+            latest_mtime_ns = mtime_ns
+            latest_path = str(path)
     return latest_mtime_ns, latest_path
 
 
@@ -768,16 +781,10 @@ def _build_worker(account_dir: Path, rebuild: bool, source: str = "decrypted") -
                     except Exception:
                         lower_to_actual = {}
 
-                    my_rowid = None
-                    try:
-                        r2 = msg_conn.execute(
-                            "SELECT rowid FROM Name2Id WHERE user_name = ? LIMIT 1",
-                            (account_dir.name,),
-                        ).fetchone()
-                        if r2 is not None and r2[0] is not None:
-                            my_rowid = int(r2[0])
-                    except Exception:
-                        my_rowid = None
+                    my_rowid, _matched_self_username = resolve_account_self_rowid(
+                        msg_conn,
+                        account_dir,
+                    )
 
                     for conv_username, sess_info in sessions.items():
                         _update_build_state(key, currentConversation=str(conv_username))
