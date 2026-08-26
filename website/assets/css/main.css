@@ -579,7 +579,7 @@ main { position: relative; z-index: 1; }
 
 /* 年度总结 = 居中宽银幕影厅：大幅影格 + 上下细胶片条（HUD / 进度轴），底部给滚动数字留位 */
 .viewer {
-  --film: min(88vw, calc(56vh * 2.216), 1480px);
+  --film: min(88vw, calc(56vh * 1.888), 1480px); /* 1.888 = 影片幅面 1916/1015，与 .viewer__slides 的 aspect-ratio 互锁 */
   position: absolute; inset: 0; z-index: 3;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: clamp(12px, 1.8vh, 20px);
@@ -603,15 +603,16 @@ main { position: relative; z-index: 1; }
     repeating-linear-gradient(0deg, rgba(0, 0, 0, 0.05) 0 1px, transparent 1px 3px),
     radial-gradient(135% 115% at 50% 48%, transparent 58%, rgba(5, 8, 7, 0.55) 100%);
 }
-.viewer__slides { position: relative; aspect-ratio: 1000 / 452; background: #0d130f; border-radius: 10px; overflow: hidden; }
+.viewer__slides { position: relative; aspect-ratio: 1916 / 1015; background: #0d130f; border-radius: 10px; overflow: hidden; }
 .cinema__foot { width: var(--film); display: flex; align-items: center; gap: clamp(16px, 2vw, 34px); }
 .viewer__ticks { display: flex; gap: 6px; flex: 1; }
 .viewer__ticks i { height: 2px; flex: 1; background: var(--line-strong); transition: background 0.35s, box-shadow 0.35s; }
 .viewer__ticks i.on { background: var(--neon); box-shadow: 0 0 10px var(--glow); }
 
-.viewer__slides img {
+.viewer__slides img,
+.viewer__slides video {
   position: absolute; inset: 0; width: 100%; height: 100%;
-  object-fit: cover; object-position: top; display: block;
+  object-fit: contain; object-position: center; display: block; background: #0d130f;
   will-change: clip-path, transform, opacity, filter;
 }
 
@@ -835,6 +836,51 @@ main { position: relative; z-index: 1; }
 .mac__compat li b { display: inline-block; min-width: 32px; color: var(--neon); letter-spacing: 0.12em; }
 .mac__legal { text-align: center; font-size: 11px; letter-spacing: 0.16em; color: var(--ink-faint); }
 
+/* ─────────────────────────── act 07 · friends（同路人 · 递名片）─────────────────────────── */
+
+.friends__pin {
+  min-height: 100vh; position: relative;
+  display: flex; flex-direction: column; justify-content: center;
+  gap: clamp(34px, 6.5vh, 70px);
+  padding: clamp(84px, 12vh, 140px) clamp(20px, 6vw, 90px) clamp(40px, 7vh, 80px);
+}
+.friends__top { display: flex; flex-direction: column; gap: 14px; max-width: 1020px; }
+.friends__title { margin-top: 10px; font-size: clamp(1.9rem, 4.2vw, 3.7rem); font-weight: 900; line-height: 1.14; letter-spacing: -0.01em; }
+.friends__title em { color: var(--amber); text-shadow: 0 0 42px rgba(255, 194, 75, 0.4); }
+.friends__sub { font-size: clamp(12.5px, 1.15vw, 15px); color: var(--ink-dim); letter-spacing: 0.06em; }
+
+/* 名录：无容器巨字花名册，细线分隔；02 号 ghost 位 = 永远在翻滚的密文空档 */
+.roster { display: flex; flex-direction: column; margin-top: clamp(6px, 1.5vh, 18px); }
+.ro-row {
+  position: relative; display: grid;
+  grid-template-columns: clamp(44px, 6vw, 96px) 1fr auto;
+  align-items: baseline; column-gap: clamp(14px, 2.5vw, 40px);
+  padding: clamp(22px, 3.8vh, 40px) 0 clamp(18px, 3.2vh, 34px);
+}
+.ro-rule {
+  position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: var(--line); transform-origin: left;
+  transition: background 0.35s, box-shadow 0.35s;
+}
+.ro-rule--end { position: static; display: block; height: 1px; background: var(--line); transform-origin: left; }
+.ro-idx { font-size: 11px; letter-spacing: 0.24em; color: var(--ink-faint); }
+.ro-name {
+  font-size: clamp(2rem, 5vw, 4.3rem); font-weight: 900; line-height: 1.05; letter-spacing: -0.01em;
+  color: var(--ink); transition: color 0.3s, transform 0.45s, text-shadow 0.3s; will-change: transform;
+}
+.ro-name.is-hex { font-family: inherit; color: rgba(255, 194, 75, 0.55); }
+.ro-meta { font-size: 10.5px; letter-spacing: 0.18em; color: var(--ink-dim); display: inline-flex; align-items: baseline; gap: 10px; }
+.ro-arw { font-style: normal; transition: transform 0.3s, color 0.3s; }
+a.ro-row:hover .ro-name { color: var(--amber); transform: translateX(8px); text-shadow: 0 0 46px rgba(255, 194, 75, 0.45); }
+a.ro-row:hover .ro-rule { background: var(--amber); box-shadow: 0 0 12px rgba(255, 194, 75, 0.5); }
+a.ro-row:hover .ro-arw { color: var(--amber); transform: translate(3px, -3px); }
+a.ro-row:hover .ro-meta { color: var(--ink); }
+.ro-row--ghost .ro-name {
+  font-size: clamp(1.5rem, 3.8vw, 3.2rem); font-weight: 600; letter-spacing: 0.08em;
+  color: rgba(255, 194, 75, 0.32);
+}
+.ro-row--ghost .ro-idx, .ro-row--ghost .ro-meta { opacity: 0.55; }
+
 /* ─────────────────────────── act 07 · cta（终幕 · 归档落款）─────────────────────────── */
 
 /* 一屏严格容纳：slug / 巨字（弹性行）/ 下载闸 / 索引 / 版权 */
@@ -976,6 +1022,17 @@ main { position: relative; z-index: 1; }
 .cta__colophon-row .cc-a { display: flex; align-items: center; gap: 9px; color: var(--ink-dim); }
 .cta__colophon-row .cc-a i { width: 5px; height: 5px; background: var(--neon); box-shadow: 0 0 8px var(--glow); flex: none; }
 
+/* 矮屏(≤920px 高)：压缩 machine 幕垂直预算，保住底部 ENGINE / PLATFORM 行（用户真机曾被裁） */
+@media (max-height: 920px) {
+  .mac__pin { padding-top: clamp(52px, 8.5vh, 92px); padding-bottom: clamp(16px, 2.6vh, 34px); row-gap: clamp(8px, 1.6vh, 18px); }
+  .mac__title { margin-top: 8px; }
+  .mac__trace { height: clamp(60px, 10vh, 96px); }
+  .mac__zero { font-size: min(clamp(4rem, 12vw, 11rem), 20vh); }
+  .mac__guards { padding-top: clamp(12px, 2vh, 20px); }
+  .mac__guards span { margin-top: 6px; }
+  .mac__foot { padding-top: clamp(10px, 1.6vh, 16px); }
+}
+
 /* ─────────────────────────── responsive ─────────────────────────── */
 
 @media (max-width: 960px) {
@@ -1006,7 +1063,9 @@ main { position: relative; z-index: 1; }
   .fwchips { width: min(92vw, 560px); display: grid; grid-template-columns: 1fr 1fr; gap: 14px 26px; }
   .fwchips--l { align-items: start; text-align: left; }
   .fw__stage { --fwr: min(24vw, 132px); width: min(54vw, 300px); }
-  .viewer { --film: min(94vw, calc(46vh * 2.216)); }
+  .viewer { --film: min(94vw, calc(46vh * 1.888)); }
+  .ro-row { grid-template-columns: auto 1fr; }
+  .ro-meta { grid-column: 1 / -1; margin-top: 10px; }
   .cta__title { white-space: normal; font-size: min(13.5vw, 11vh); line-height: 1.08; margin-bottom: clamp(10px, 3vh, 30px); }
   .cta__index { grid-template-columns: 1fr 1fr; gap: clamp(12px, 3vh, 22px) 26px; }
   .ix:nth-child(2), .ix:nth-child(3), .ix:nth-child(4) { margin-top: 0; }

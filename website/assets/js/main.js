@@ -245,6 +245,7 @@ function boot() {
     buildFeatures();
     buildWrapped();
     buildMachine();
+    buildFriends();
     buildCTA();
     buildRail();
     exitLoader();
@@ -927,12 +928,18 @@ function buildFeatures() {
 /* ─────────────────────────── act 05 · wrapped ─────────────────────────── */
 
 function buildWrapped() {
-  const slides = $$("#v-slides img");
+  const slides = $$("#v-slides > *");
   const N = slides.length;
   const idxEl = $("#v-idx");
   const ticks = $$("#v-ticks i");
   const scene = $("#viewer");
   let activeIdx = -1;
+
+  // 前 5 帧是产品实录影片：进入放映室才开播（静音循环），离场即暂停
+  const vids = slides.filter((el) => el.tagName === "VIDEO");
+  let filmOn = false;
+  const playFilm = () => { filmOn = true; vids.forEach((v) => { v.muted = true; const pr = v.play(); if (pr && pr.catch) pr.catch(() => {}); }); };
+  const pauseFilm = () => { filmOn = false; vids.forEach((v) => v.pause()); };
 
   // 放映室：固定取景框内定向擦除转场，当前帧被推走、下一帧从右侧扫入
   function setFlow(f) {
@@ -954,6 +961,10 @@ function buildWrapped() {
         img.style.opacity = "0"; img.style.zIndex = "0";
         img.style.clipPath = i < c ? "inset(0 100% 0 0)" : "inset(0 0 0 100%)";
       }
+    });
+    if (filmOn) [c, c + 1].forEach((i) => {
+      const el = slides[i];
+      if (el && el.tagName === "VIDEO" && el.paused) { const pr = el.play(); if (pr && pr.catch) pr.catch(() => {}); }
     });
     const idx = Math.round(fc);
     if (idx !== activeIdx) {
@@ -978,8 +989,10 @@ function buildWrapped() {
     scrollTrigger: {
       trigger: "#wrapped", pin: true, scrub: 0.7,
       start: "top top", end: "+=430%",
-      onEnter: () => { stage.morphTo("year", { duration: 1.7 }); stage.setTint(0x6b4a12, 1.6); stage.setOpacity(0.4, 1); },
-      onLeaveBack: () => { stage.morphTo("bubble", { duration: 1.4 }); stage.setTint(0x0b3d24, 1.4); stage.setOpacity(0.9, 1); },
+      onEnter: () => { playFilm(); stage.morphTo("year", { duration: 1.7 }); stage.setTint(0x6b4a12, 1.6); stage.setOpacity(0.4, 1); },
+      onEnterBack: playFilm,
+      onLeave: pauseFilm,
+      onLeaveBack: () => { pauseFilm(); stage.morphTo("bubble", { duration: 1.4 }); stage.setTint(0x0b3d24, 1.4); stage.setOpacity(0.9, 1); },
     },
   });
 
@@ -1313,6 +1326,84 @@ function buildStack() {
   });
 }
 
+/* ─────────────────────────── act 07 · friends（同路人 · 巨字名录）─────────────────────────── */
+
+function buildFriends() {
+  if (REDUCED) return;
+
+  const hexStrOf = (n) => { let h = ""; for (let i = 0; i < n; i++) h += HEXC[(Math.random() * 16) | 0]; return h; };
+  const names = $$(".ro-dec");
+
+  // 名录以密文态待命：真名先置为等长乱码,进场时逐字落定
+  names.forEach((el) => {
+    el.dataset.final = el.dataset.final || el.textContent;
+    el.textContent = hexStrOf(Math.max(6, Math.round(el.dataset.final.length * 1.4)));
+    el.classList.add("is-hex");
+  });
+
+  const introChars = new SplitText(".friends__title", { type: "chars" }).chars;
+  gsap.set(introChars, { opacity: 0, yPercent: 62, rotateX: -52, transformPerspective: 820, transformOrigin: "50% 100%" });
+  gsap.set(".friends__top .sec-tag, .friends__sub", { opacity: 0, y: 18 });
+  gsap.set(".ro-rule, .ro-rule--end", { scaleX: 0 });
+  gsap.set(".ro-idx, .ro-meta", { opacity: 0 });
+  gsap.set(".ro-name", { opacity: 0, y: 20 });
+
+  ScrollTrigger.create({
+    trigger: "#friends", start: "top 62%", once: true,
+    onEnter: () => {
+      const tl = gsap.timeline();
+      // 标题逐字立起 → 细线逐条抽出 → 编号/meta 亮起 → 巨字名以密文升起、逐字解密落定 → ghost 位开始翻滚
+      tl.to(".friends__top .sec-tag", { opacity: 1, y: 0, duration: 0.5, ease: "flow" }, 0)
+        .to(introChars, { opacity: 1, yPercent: 0, rotateX: 0, duration: 0.85, stagger: 0.04, ease: "cine" }, 0.1)
+        .to(".friends__sub", { opacity: 1, y: 0, duration: 0.6, ease: "flow" }, 0.55)
+        .to(".ro-rule, .ro-rule--end", { scaleX: 1, duration: 0.9, stagger: 0.14, ease: "cine" }, 0.7)
+        .to(".ro-idx, .ro-meta", { opacity: 1, stagger: 0.08, duration: 0.5 }, 1.0)
+        .to(".ro-name", { opacity: 1, y: 0, stagger: 0.12, duration: 0.6, ease: "flow" }, 1.05);
+      names.forEach((el, i) => tl.to(el, {
+        duration: 0.8, scrambleText: { text: el.dataset.final, chars: HEXC, speed: 0.6 },
+        onComplete: () => el.classList.remove("is-hex"),
+      }, 1.25 + i * 0.15));
+      // ghost 位：一串永远解不开的密文,慢速翻滚
+      tl.call(() => {
+        const ghost = $("#ro-ghost");
+        gsap.to(ghost, {
+          duration: 2.2, repeat: -1, repeatDelay: 0.6, repeatRefresh: true, ease: "none",
+          scrambleText: { text: () => hexStrOf(12), chars: HEXC, speed: 0.3 },
+        });
+      }, [], 2.1);
+      // 入场收尾兜底：无论中途发生什么,巨字名必须以终态站定
+      // (曾因 hover 补间 overwrite:true 在入场期杀掉显形补间,名字永久卡在 opacity 0 —— 用户真机截图实证)
+      tl.call(() => {
+        names.forEach((el) => {
+          gsap.set(el, { opacity: 1, y: 0 });
+          el.textContent = el.dataset.final;
+          el.classList.remove("is-hex");
+        });
+        // hover = 快速重解密一次(解密闪回)。入场完成后才绑,且只杀自己上一次的 hover 补间
+        if (!TOUCH) names.forEach((el) => {
+          const row = el.closest("a.ro-row");
+          if (!row) return;
+          let hv = null;
+          row.addEventListener("pointerenter", () => {
+            if (hv) hv.kill();
+            hv = gsap.to(el, { duration: 0.45, scrambleText: { text: el.dataset.final, chars: HEXC, speed: 1 } });
+          });
+        });
+      }, [], ">");
+    },
+  });
+
+  // 粒子明暗独立管理（入场触发器是 once,挂它身上的话 onLeaveBack 永远不会执行）：
+  // 在幕内压成远景别糊字,离场按邻幕期望恢复（machine 0.5 / cta 0.9）
+  ScrollTrigger.create({
+    trigger: "#friends", start: "top 62%", end: "bottom 40%",
+    onEnter: () => { stage.setOpacity(0.22, 1.2); stage.setTint(0x0e4d33, 1.4); },
+    onEnterBack: () => { stage.setOpacity(0.22, 1); stage.setTint(0x0e4d33, 1.2); },
+    onLeave: () => { stage.setOpacity(0.9, 1); },
+    onLeaveBack: () => { stage.setOpacity(0.5, 1); },
+  });
+}
+
 /* ─────────────────────────── act 07 · cta（终幕 · 归档落款）─────────────────────────── */
 
 function buildCTA() {
@@ -1415,7 +1506,8 @@ function setupCursor() {
     "04": (x, y) => "0x" + hx(x) + "·" + hx(y),
     "05": () => "WRAPPED 2025",
     "06": () => "0 B · EGRESS",
-    "07": () => "GET LATEST ↓",
+    "07": () => "SAY HI ↗",
+    "08": () => "GET LATEST ↓",
   };
   let act = "01";
   window.__cursorAct = (id) => {

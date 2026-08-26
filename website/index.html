@@ -62,7 +62,7 @@
   </header>
 
   <aside class="rail" aria-hidden="true">
-    <div class="rail__idx mono"><span id="rail-cur">01</span><em>/ 07</em></div>
+    <div class="rail__idx mono"><span id="rail-cur">01</span><em>/ 08</em></div>
     <div class="rail__line"><i id="rail-fill"></i></div>
   </aside>
 
@@ -217,24 +217,26 @@
           <h2 class="wrapped__title"><span>而这一年，</span><br/><span>值得被数据<em>温柔复述</em></span></h2>
         </header>
 
-        <!-- 年度总结 = 展示 6 张年度卡片截图（下一个 AI 在此基础上重做呈现方式；截图 1919×868 横版，必须平铺可读、勿裁勿倾斜） -->
+        <!-- 年度总结 = 8 帧走片：前 5 帧为产品实录影片（MP4 由 frontend/public/AnnualSummary1-5.gif 转码，1916×1015 附近横版），后 3 帧静帧 1919×860；一律 contain 平铺可读、勿裁勿倾斜 -->
         <div class="viewer" id="viewer">
           <div class="cinema__hud mono">
             <span class="hudl"><span class="tick"></span>WRAPPED FILM · 2025</span>
-            <span>FRAME <b id="v-idx">01</b><i>/ 06</i></span>
+            <span>FRAME <b id="v-idx">01</b><i>/ 08</i></span>
           </div>
           <figure class="viewer__frame">
             <div class="viewer__slides" id="v-slides">
-              <img src="assets/img/AnnualSummary1.png" alt="年度总结卡片：字数统计" decoding="async" />
-              <img src="assets/img/AnnualSummary2.png" alt="年度总结卡片：赛博作息" decoding="async" />
-              <img src="assets/img/AnnualSummary3.png" alt="年度总结卡片：回复速度" decoding="async" />
+              <video src="assets/media/AnnualSummary1.mp4" poster="assets/media/AnnualSummary1.poster.jpg" muted loop playsinline preload="metadata" aria-label="年度总结实录：开场「你的消息都发给了谁」"></video>
+              <video src="assets/media/AnnualSummary2.mp4" poster="assets/media/AnnualSummary2.poster.jpg" muted loop playsinline preload="metadata" aria-label="年度总结实录：年度总览与消息热力图"></video>
+              <video src="assets/media/AnnualSummary3.mp4" poster="assets/media/AnnualSummary3.poster.jpg" muted loop playsinline preload="metadata" aria-label="年度总结实录：赛博作息「早八人还是夜猫子」"></video>
+              <video src="assets/media/AnnualSummary4.mp4" poster="assets/media/AnnualSummary4.poster.jpg" muted loop playsinline preload="metadata" aria-label="年度总结实录：铸字车间「你今年打了多少字」"></video>
+              <video src="assets/media/AnnualSummary5.mp4" poster="assets/media/AnnualSummary5.poster.jpg" muted loop playsinline preload="metadata" aria-label="年度总结实录：私人词典「你说过的话」"></video>
               <img src="assets/img/AnnualSummary6.png" alt="年度总结卡片：月度挚友墙" decoding="async" />
               <img src="assets/img/AnnualSummary7.png" alt="年度总结卡片：表情宇宙" decoding="async" />
               <img src="assets/img/AnnualSummary8.png" alt="年度总结卡片：Bento 总览" decoding="async" />
             </div>
           </figure>
           <div class="cinema__foot">
-            <div class="viewer__ticks" id="v-ticks"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <div class="viewer__ticks" id="v-ticks"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
           </div>
         </div>
 
@@ -245,7 +247,7 @@
           <div class="wstat"><b class="mono" data-count="8431">0</b><span>个表情包一起走过</span></div>
         </div>
 
-        <p class="wrapped__note mono">8 张动态卡片 — 年度总览 · 赛博作息 · 字数统计 · 回复速度 · 表情宇宙 · 月度挚友墙 · 关键词云 · Bento 总结</p>
+        <p class="wrapped__note mono">8 张动态卡片 — 年度总览 · 赛博作息 · 字数统计 · 回复速度 · 表情宇宙 · 月度挚友墙 · 年度口头禅 · Bento 总结</p>
       </div>
     </section>
 
@@ -306,11 +308,39 @@
       </div>
     </section>
 
-    <!-- ═══════════ ACT 07 · CTA / FOOTER ═══════════ -->
-    <section class="act cta" id="cta" data-act="07">
+    <!-- ═══════════ ACT 07 · FRIENDS（同路人 · 巨字名录）═══════════ -->
+    <section class="act friends" id="friends" data-act="07">
+      <div class="friends__pin">
+        <header class="friends__top">
+          <p class="sec-tag mono"><span class="tick"></span>FELLOW TRAVELERS — 同路人</p>
+          <h2 class="friends__title">做这件事的，<em>不止我们</em>。</h2>
+          <p class="friends__sub">他们也一样——数据不出你的电脑。</p>
+        </header>
+
+        <!-- 装置：同路人名录 —— 无容器的巨字花名册；02 号是永远在翻滚的密文空位。加友链 = 复制 01 行、顺延编号 -->
+        <div class="roster">
+          <a class="ro-row" data-cursor="hover" href="https://miyu.aiqji.com/" target="_blank" rel="noopener">
+            <i class="ro-rule" aria-hidden="true"></i>
+            <span class="ro-idx mono">01</span>
+            <b class="ro-name ro-dec" data-final="密语 CipherTalk">密语 CipherTalk</b>
+            <span class="ro-meta mono">微信聊天记录，本地查看 · miyu.aiqji.com<i class="ro-arw">↗</i></span>
+          </a>
+          <div class="ro-row ro-row--ghost" aria-hidden="true">
+            <i class="ro-rule"></i>
+            <span class="ro-idx mono">02</span>
+            <b class="ro-name mono" id="ro-ghost">3F8A02C4E17B</b>
+            <span class="ro-meta mono">AWAITING — 虚位以待</span>
+          </div>
+          <i class="ro-rule ro-rule--end" aria-hidden="true"></i>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════ ACT 08 · CTA / FOOTER ═══════════ -->
+    <section class="act cta" id="cta" data-act="08">
 
       <div class="cta__slug mono">
-        <span class="cta__slug-t"><i class="tick"></i>ACT 07 · 终章</span>
+        <span class="cta__slug-t"><i class="tick"></i>ACT 08 · 终章</span>
         <i class="cta__leader" aria-hidden="true"></i>
         <span class="cta__slug-t" id="cta-seal">FILE CLOSED · SEALED 2026</span>
       </div>
