@@ -35,6 +35,7 @@ jobs:
     environment: macos-private-pki-production
     timeout-minutes: 120
     env:
+      UV_MANAGED_PYTHON: "true"
       WCE_MACOS_SIGNING_MODE: self-signed
       WCE_MACOS_XKEY_ARTIFACT_REPOSITORY: ${{ vars.WCE_MACOS_XKEY_ARTIFACT_REPOSITORY }}
       WCE_MACOS_XKEY_ARTIFACT_RUN_ID: ${{ vars.WCE_MACOS_XKEY_ARTIFACT_RUN_ID }}
@@ -368,6 +369,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install uv
+          uv python install 3.11
           npm ci --prefix frontend
           npm ci --prefix desktop
 
