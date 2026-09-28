@@ -2,6 +2,10 @@ name: macOS Private Build
 
 on:
   workflow_call:
+    outputs:
+      source_runtime_coordinates:
+        description: Verified producer coordinates for the source runtime promotion
+        value: ${{ jobs.build-macos-arm64.outputs.source_runtime_coordinates }}
     inputs:
       version:
         description: Package version; omitted callers derive it from a v* tag
@@ -34,6 +38,8 @@ jobs:
     runs-on: macos-14
     environment: macos-private-pki-production
     timeout-minutes: 120
+    outputs:
+      source_runtime_coordinates: ${{ steps.source-runtime-coordinates.outputs.json }}
     env:
       UV_MANAGED_PYTHON: "true"
       WCE_MACOS_SIGNING_MODE: self-signed
@@ -119,6 +125,29 @@ jobs:
             --component macos-xkey \
             --component macos-integrity \
             --output-root "$RUNNER_TEMP"
+
+      - name: Expose source runtime producer coordinates
+        id: source-runtime-coordinates
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          fields = {
+              "native_core_run_id": "WCE_NATIVE_CORE_ARTIFACT_RUN_ID",
+              "native_core_source_revision": "WCE_NATIVE_CORE_SOURCE_REVISION",
+              "native_core_build_id": "WCE_NATIVE_CORE_BUILD_ID",
+              "xkey_run_id": "WCE_MACOS_XKEY_ARTIFACT_RUN_ID",
+              "xkey_source_revision": "WCE_MACOS_XKEY_SOURCE_REVISION",
+              "xkey_build_id": "WCE_MACOS_XKEY_BUILD_ID",
+              "integrity_run_id": "WCE_INTEGRITY_ARTIFACT_RUN_ID",
+              "integrity_source_revision": "WCE_INTEGRITY_SOURCE_REVISION",
+              "integrity_build_id": "WCE_INTEGRITY_BUILD_ID",
+              "integrity_binary_sha256": "WCE_INTEGRITY_BINARY_SHA256",
+          }
+          print("json=" + json.dumps({key: os.environ[value] for key, value in fields.items()}, separators=(",", ":")))
+          PY
 
       - name: Verify protected pins
         shell: bash
