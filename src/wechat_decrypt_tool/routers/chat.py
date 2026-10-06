@@ -4053,12 +4053,12 @@ def _postprocess_full_messages(
                     if md5:
                         m["imageUrl"] = (
                             base_url
-                            + f"/api/chat/media/image?account={quote(account_dir.name)}&md5={quote(md5)}&username={quote(username)}"
+                            + f"/api/chat/media/image?account={quote(account_dir.name)}&md5={quote(md5)}&username={quote(username)}&v=local-quality-1"
                         )
                     elif file_id:
                         m["imageUrl"] = (
                             base_url
-                            + f"/api/chat/media/image?account={quote(account_dir.name)}&file_id={quote(file_id)}&username={quote(username)}"
+                            + f"/api/chat/media/image?account={quote(account_dir.name)}&file_id={quote(file_id)}&username={quote(username)}&v=local-quality-1"
                         )
             elif rt == "emoji":
                 md5 = str(m.get("emojiMd5") or "")
@@ -4141,7 +4141,7 @@ def _postprocess_full_messages(
                         file_id = f"{lid}_{ct}"
                         m["thumbUrl"] = (
                             base_url
-                            + f"/api/chat/media/image?account={quote(account_dir.name)}&file_id={quote(file_id)}&username={quote(username)}"
+                            + f"/api/chat/media/image?account={quote(account_dir.name)}&file_id={quote(file_id)}&username={quote(username)}&v=local-quality-1"
                         )
             elif rt == "voice":
                 if str(m.get("serverId") or ""):
@@ -4167,7 +4167,11 @@ async def list_chat_accounts():
             SNS_REALTIME_AUTOSYNC.ensure_account(ctx.name, schedule_startup=True)
     accounts = [ctx.name for ctx in contexts]
     account_infos = [_chat_account_context_public(ctx) for ctx in contexts]
-    switchable_accounts = [ctx.name for ctx in contexts if bool(getattr(ctx, "keys_ready", False))]
+    switchable_accounts = [
+        ctx.name for ctx in contexts
+        if ctx.db_key_present or bool(getattr(ctx, "has_decrypted_dbs", False))
+    ]
+    key_ready_accounts = [ctx.name for ctx in contexts if bool(getattr(ctx, "keys_ready", False))]
     switchable_account_set = set(switchable_accounts)
     switchable_account_infos = [
         info for info in account_infos if str(info.get("account") or "").strip() in switchable_account_set
@@ -4194,7 +4198,7 @@ async def list_chat_accounts():
         "default_account": accounts[0],
         "switchable_accounts": switchable_accounts,
         "switchableAccounts": switchable_accounts,
-        "keyReadyAccounts": switchable_accounts,
+        "keyReadyAccounts": key_ready_accounts,
         "default_switchable_account": switchable_accounts[0] if switchable_accounts else None,
         "defaultSwitchableAccount": switchable_accounts[0] if switchable_accounts else None,
         "accountInfos": account_infos,
@@ -4434,7 +4438,7 @@ def _chat_account_context_public(
         "imageAesKeyPresent": bool(getattr(ctx, "image_aes_key_present", False)),
         "keysReady": bool(getattr(ctx, "keys_ready", False)),
         "keyReady": bool(getattr(ctx, "keys_ready", False)),
-        "switchable": bool(getattr(ctx, "keys_ready", False)),
+        "switchable": bool(getattr(ctx, "db_key_present", False) or has_decrypted_dbs),
         "keysUpdatedAt": str(getattr(ctx, "keys_updated_at", "") or ""),
         "realtimeAvailable": bool(realtime_available),
         "realtime": {
@@ -7449,12 +7453,12 @@ def list_chat_messages(
                     if md5:
                         m["imageUrl"] = (
                             base_url
-                            + f"/api/chat/media/image?account={quote(account_dir.name)}&md5={quote(md5)}&username={quote(username)}"
+                            + f"/api/chat/media/image?account={quote(account_dir.name)}&md5={quote(md5)}&username={quote(username)}&v=local-quality-1"
                         )
                     elif file_id:
                         m["imageUrl"] = (
                             base_url
-                            + f"/api/chat/media/image?account={quote(account_dir.name)}&file_id={quote(file_id)}&username={quote(username)}"
+                            + f"/api/chat/media/image?account={quote(account_dir.name)}&file_id={quote(file_id)}&username={quote(username)}&v=local-quality-1"
                         )
             elif rt == "emoji":
                 md5 = str(m.get("emojiMd5") or "")
@@ -7532,7 +7536,7 @@ def list_chat_messages(
                         file_id = f"{lid}_{ct}"
                         m["thumbUrl"] = (
                             base_url
-                            + f"/api/chat/media/image?account={quote(account_dir.name)}&file_id={quote(file_id)}&username={quote(username)}"
+                            + f"/api/chat/media/image?account={quote(account_dir.name)}&file_id={quote(file_id)}&username={quote(username)}&v=local-quality-1"
                         )
             elif rt == "voice":
                 if str(m.get("serverId") or ""):
