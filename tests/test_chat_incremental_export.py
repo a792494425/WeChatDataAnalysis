@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -23,6 +24,36 @@ class TestChatIncrementalExport(unittest.TestCase):
     _seed_media_files = _BaseChatExportTest._seed_media_files
     _seed_wxid_media_files = _BaseChatExportTest._seed_wxid_media_files
     _seed_source_info = _BaseChatExportTest._seed_source_info
+
+    # 导出面板加入“位置”之前，“全部选择”提交的消息类型。
+    _LEGACY_DIALOG_MESSAGE_TYPES = (
+        "text",
+        "image",
+        "emoji",
+        "video",
+        "voice",
+        "chatHistory",
+        "transfer",
+        "redPacket",
+        "file",
+        "link",
+        "quote",
+        "system",
+        "voip",
+    )
+    _NEW_LOCATION_ROWS = (
+        (8, 1008, 1, 8, 2, 1735689608, "升级后的新消息", None),
+        (
+            9,
+            1009,
+            48,
+            9,
+            2,
+            1735689609,
+            '<msg><location x="31.2304" y="121.4737" scale="15" label="上海市黄浦区" poiname="外滩" /></msg>',
+            None,
+        ),
+    )
 
     def _wait_for_job(self, manager, export_id: str):
         for _ in range(400):
@@ -131,6 +162,17 @@ class TestChatIncrementalExport(unittest.TestCase):
         matches = list((folder / "conversations").glob(f"*/messages.{suffix}"))
         assert len(matches) == 1
         return matches[0]
+
+    def _insert_message_rows(self, account_dir: Path, username: str, rows) -> None:
+        connection = sqlite3.connect(str(account_dir / "message_0.db"))
+        try:
+            connection.executemany(
+                f"INSERT INTO {self._message_table(username)} VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                list(rows),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def test_unavailable_pending_media_is_deduplicated_without_repair_prompt(self):
         with TemporaryDirectory() as td:
@@ -588,6 +630,124 @@ class TestChatIncrementalExport(unittest.TestCase):
                 else:
                     os.environ["WECHAT_TOOL_DATA_DIR"] = previous
 
+    def test_html_folder_preserves_contact_order_across_incremental_exports(self):
+        for privacy_mode in (False, True):
+            with self.subTest(privacy_mode=privacy_mode), TemporaryDirectory() as td:
+                root = Path(td)
+                account = "wxid_order_account"
+                usernames = ["wxid_first", "wxid_second", "wxid_third"]
+                account_dir = self._prepare_account(root, account=account, username=usernames[0])
+                for index, username in enumerate(usernames[1:], start=20):
+                    self._add_conversation(account_dir, username=username, display_name=username, local_id=index)
+                with mock.patch.dict(os.environ, {"WECHAT_TOOL_DATA_DIR": str(root)}):
+                    service = self._reload_export_modules()
+
+                    def export(selected):
+                        job = self._create_folder_job(
+                            service.CHAT_EXPORT_MANAGER, account=account, usernames=selected,
+                            output_dir=root / "exports", export_format="html", privacy_mode=privacy_mode,
+                        )
+                        self.assertEqual(job.status, "done", msg=job.error)
+                        return job
+
+                    def catalog(folder):
+                        return json.loads((folder / "assets/chat-sessions.js").read_text(encoding="utf-8")
+                                          .removeprefix("window.__WCE_FOLDER_SESSIONS__=").rstrip(";\r\n"))["items"]
+
+                    first = export(usernames)
+                    folder = first.folder_path
+                    expected = [item["convDir"] for item in catalog(folder)]
+                    first_names = [item["displayName"] for item in catalog(folder)]
+                    state_path = folder / ".wechat-chat-export.json"
+                    baseline = json.loads(state_path.read_text(encoding="utf-8"))
+                    # Make the baseline dictionary order disagree with the visible catalog.
+                    baseline["conversations"] = dict(reversed(list(baseline["conversations"].items())))
+                    state_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+                    export(list(reversed(usernames)))
+                    self.assertEqual([item["convDir"] for item in catalog(folder)], expected)
+                    self.assertEqual([item["displayName"] for item in catalog(folder)], first_names)
+                    export([usernames[0]])
+                    self.assertEqual([item["convDir"] for item in catalog(folder)], expected)
+
+                    # Appending real messages also updates the existing entry in place.
+                    with sqlite3.connect(str(account_dir / "message_0.db")) as connection:
+                        connection.execute(
+                            f"INSERT INTO {self._message_table(usernames[0])} VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (8, 1008, 1, 8, 2, 1735689800, "新增消息不改变联系人位置", None),
+                        )
+                    appended = export([usernames[0]])
+                    self.assertEqual(appended.incremental.get("messagesAdded"), 1)
+                    self.assertEqual([item["convDir"] for item in catalog(folder)], expected)
+
+                    # Migrate old baselines which predate the explicit order field.
+                    baseline = json.loads(state_path.read_text(encoding="utf-8"))
+                    baseline.pop("conversationOrder", None)
+                    baseline["conversations"] = dict(reversed(list(baseline["conversations"].items())))
+                    state_path.write_text(json.dumps(baseline), encoding="utf-8")
+                    migrated = export([usernames[1]])
+                    self.assertEqual([item["convDir"] for item in catalog(folder)], expected)
+                    self.assertIn("conversationOrder", json.loads(state_path.read_text(encoding="utf-8")))
+                    self.assertEqual(migrated.incremental.get("filesChanged"), 0)
+
+                    new_username = "wxid_new"
+                    self._add_conversation(account_dir, username=new_username, display_name="新增联系人", local_id=30)
+                    export([new_username, usernames[0]])
+                    items = catalog(folder)
+                    expected.append(items[-1]["convDir"])
+                    self.assertEqual([item["convDir"] for item in items], expected)
+                    self.assertEqual(len(set(expected)), 4)
+                    index_html = (folder / "index.html").read_text(encoding="utf-8")
+                    self.assertEqual(re.findall(r'class="wce-index-item" href="(.*?)/messages.html"', index_html), expected)
+                    baseline = json.loads(state_path.read_text(encoding="utf-8"))
+                    self.assertEqual([baseline["conversations"][key]["directory"]
+                                      for key in baseline["conversationOrder"]], expected)
+                    no_change = export([usernames[0], new_username])
+                    self.assertEqual(no_change.incremental.get("filesChanged"), 0)
+                    self.assertEqual([item["convDir"] for item in catalog(folder)], expected)
+
+    def test_browser_html_folder_preserves_saved_order(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            account = "wxid_browser_order"
+            usernames = ["wxid_first", "wxid_second"]
+            account_dir = self._prepare_account(root, account=account, username=usernames[0])
+            self._add_conversation(account_dir, username=usernames[1], display_name="第二个联系人")
+            with mock.patch.dict(os.environ, {"WECHAT_TOOL_DATA_DIR": str(root)}):
+                service = self._reload_export_modules()
+                browser_files = {}
+
+                def export(selected, baseline=None):
+                    job = self._create_folder_job(
+                        service.CHAT_EXPORT_MANAGER, account=account, usernames=selected,
+                        output_dir=None, export_format="html", baseline=baseline,
+                    )
+                    self.assertEqual(job.status, "done", msg=job.error)
+                    if baseline and "conversationOrder" not in baseline:
+                        self.assertFalse(job.change_manifest["state"]["unchanged"])
+                    state = json.loads((job.staging_dir / ".wechat-chat-export.json").read_text(encoding="utf-8"))
+                    for entry in job.change_manifest["files"]:
+                        if entry["path"] == "assets/chat-sessions.js":
+                            browser_files[entry["path"]] = job.staged_files[entry["fileId"]].read_text(encoding="utf-8")
+                    text = browser_files["assets/chat-sessions.js"]
+                    items = json.loads(text.removeprefix("window.__WCE_FOLDER_SESSIONS__=").rstrip(";\r\n"))["items"]
+                    service.CHAT_EXPORT_MANAGER.commit_staged_files(job.export_id)
+                    return state, [item["convDir"] for item in items]
+
+                baseline, expected = export(usernames)
+                # The transported JSON still sorts hashes; the explicit list controls order.
+                baseline = json.loads(json.dumps(baseline, sort_keys=True))
+                baseline, actual = export(list(reversed(usernames)), baseline)
+                self.assertEqual(actual, expected)
+                _, actual = export([usernames[0]], baseline)
+                self.assertEqual(actual, expected)
+                legacy_order = baseline.pop("conversationOrder")
+                baseline["legacyConversationOrder"] = legacy_order
+                migrated, actual = export([usernames[0]], baseline)
+                self.assertEqual(actual, expected)
+                self.assertEqual(migrated["conversationOrder"], legacy_order)
+                self.assertNotIn("legacyConversationOrder", migrated)
+
     def test_html_folder_shared_session_catalog_respects_privacy_mode(self):
         with TemporaryDirectory() as td:
             root = Path(td)
@@ -885,6 +1045,292 @@ class TestChatIncrementalExport(unittest.TestCase):
                     os.environ.pop("WECHAT_TOOL_DATA_DIR", None)
                 else:
                     os.environ["WECHAT_TOOL_DATA_DIR"] = previous
+
+    def test_folder_without_location_keeps_updating_when_location_is_requested(self):
+        legacy_types = list(self._LEGACY_DIALOG_MESSAGE_TYPES)
+        current_types = [*legacy_types, "location"]
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            account = "wxid_incremental"
+            username = "wxid_friend"
+            account_dir = self._prepare_account(root, account=account, username=username)
+            output_dir = root / "exports"
+
+            previous = os.environ.get("WECHAT_TOOL_DATA_DIR")
+            try:
+                os.environ["WECHAT_TOOL_DATA_DIR"] = str(root)
+                service = self._reload_export_modules()
+                first = self._create_folder_job(
+                    service.CHAT_EXPORT_MANAGER,
+                    account=account,
+                    username=username,
+                    output_dir=output_dir,
+                    message_types=legacy_types,
+                )
+                self.assertEqual(first.status, "done", msg=first.error)
+                self.assertEqual(first.warning, "")
+                self.assertFalse(first.incremental.get("locationTypeSkipped"))
+                folder = output_dir / "聊天增量测试"
+                state_path = folder / ".wechat-chat-export.json"
+                baseline = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertNotIn("location", baseline["config"]["messageTypes"])
+                message_file = self._managed_message_file(folder, "json")
+
+                def exported_messages():
+                    return json.loads(message_file.read_text(encoding="utf-8")).get("messages", [])
+
+                self.assertEqual(len(exported_messages()), 6)
+
+                self._insert_message_rows(account_dir, username, self._NEW_LOCATION_ROWS)
+                updated = self._create_folder_job(
+                    service.CHAT_EXPORT_MANAGER,
+                    account=account,
+                    username=username,
+                    output_dir=output_dir,
+                    message_types=current_types,
+                )
+                self.assertEqual(updated.status, "done", msg=updated.error)
+                self.assertEqual(updated.incremental.get("messagesAdded"), 1)
+                self.assertFalse(updated.repair_candidates)
+                self.assertTrue(updated.incremental.get("locationTypeSkipped"))
+                self.assertIn("基线不含“位置”类型", updated.warning)
+                self.assertEqual(updated.options["messageTypes"], legacy_types)
+                messages = exported_messages()
+                self.assertEqual(len(messages), 7)
+                self.assertIn("升级后的新消息", [str(item.get("content") or "") for item in messages])
+                self.assertNotIn("location", [str(item.get("renderType") or "") for item in messages])
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(state["config"], baseline["config"])
+                self.assertEqual(state["configFingerprint"], baseline["configFingerprint"])
+
+                for different_types in (
+                    ["text", "location"],
+                    [value for value in current_types if value != "voip"],
+                    [value for value in legacy_types if value != "voip"],
+                ):
+                    with self.subTest(message_types=different_types):
+                        with self.assertRaises(service.ChatIncrementalError) as captured:
+                            self._create_folder_job(
+                                service.CHAT_EXPORT_MANAGER,
+                                account=account,
+                                username=username,
+                                output_dir=output_dir,
+                                message_types=different_types,
+                            )
+                        self.assertEqual(captured.exception.code, "incremental_config_mismatch")
+
+                rebuilt = self._create_folder_job(
+                    service.CHAT_EXPORT_MANAGER,
+                    account=account,
+                    username=username,
+                    output_dir=output_dir,
+                    message_types=current_types,
+                    reset_baseline=True,
+                )
+                self.assertEqual(rebuilt.status, "done", msg=rebuilt.error)
+                self.assertFalse(rebuilt.incremental.get("locationTypeSkipped"))
+                self.assertNotIn("位置", rebuilt.warning)
+                self.assertEqual(rebuilt.options["messageTypes"], current_types)
+                messages = exported_messages()
+                self.assertEqual(len(messages), 9)
+                self.assertEqual(
+                    [str(item.get("locationPoiname") or "") for item in messages if item.get("renderType") == "location"],
+                    ["天安门", "外滩"],
+                )
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertIn("location", state["config"]["messageTypes"])
+
+                # 基线已经包含位置后，不勾选位置就是一次真实的配置变化。
+                with self.assertRaises(service.ChatIncrementalError) as captured:
+                    self._create_folder_job(
+                        service.CHAT_EXPORT_MANAGER,
+                        account=account,
+                        username=username,
+                        output_dir=output_dir,
+                        message_types=legacy_types,
+                    )
+                self.assertEqual(captured.exception.code, "incremental_config_mismatch")
+            finally:
+                if previous is None:
+                    os.environ.pop("WECHAT_TOOL_DATA_DIR", None)
+                else:
+                    os.environ["WECHAT_TOOL_DATA_DIR"] = previous
+
+    def test_html_folder_without_location_appends_only_baseline_types(self):
+        legacy_types = list(self._LEGACY_DIALOG_MESSAGE_TYPES)
+        current_types = [*legacy_types, "location"]
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            account = "wxid_incremental"
+            username = "wxid_friend"
+            account_dir = self._prepare_account(root, account=account, username=username)
+            output_dir = root / "exports"
+
+            previous = os.environ.get("WECHAT_TOOL_DATA_DIR")
+            try:
+                os.environ["WECHAT_TOOL_DATA_DIR"] = str(root)
+                service = self._reload_export_modules()
+                first = self._create_folder_job(
+                    service.CHAT_EXPORT_MANAGER,
+                    account=account,
+                    username=username,
+                    output_dir=output_dir,
+                    export_format="html",
+                    message_types=legacy_types,
+                )
+                self.assertEqual(first.status, "done", msg=first.error)
+                folder = output_dir / "聊天增量测试"
+                state_path = folder / ".wechat-chat-export.json"
+                baseline = json.loads(state_path.read_text(encoding="utf-8"))
+                message_file = self._managed_message_file(folder, "html")
+                # 会话列表的预览不受类型筛选影响，这里只看消息本身的 renderType 标记。
+                location_marker = 'data-render-type="location"'
+                first_html = message_file.read_text(encoding="utf-8")
+                self.assertIn("普通文本消息", first_html)
+                self.assertNotIn(location_marker, first_html)
+
+                original_full_probe = service._probe_incremental_conversation
+
+                def reject_full_probe(**_kwargs):
+                    raise AssertionError("沿用基线类型的分页会话不应重新扫描完整历史")
+
+                service._probe_incremental_conversation = reject_full_probe
+                try:
+                    # 源数据里已有的位置消息排在水位之后，不能被当成新消息追加。
+                    no_change = self._create_folder_job(
+                        service.CHAT_EXPORT_MANAGER,
+                        account=account,
+                        username=username,
+                        output_dir=output_dir,
+                        export_format="html",
+                        message_types=current_types,
+                    )
+                    self.assertEqual(no_change.status, "done", msg=no_change.error)
+                    self.assertEqual(no_change.incremental.get("messagesAdded"), 0)
+                    self.assertEqual(no_change.incremental.get("filesChanged"), 0)
+                    self.assertTrue(no_change.incremental.get("locationTypeSkipped"))
+
+                    self._insert_message_rows(account_dir, username, self._NEW_LOCATION_ROWS)
+                    appended = self._create_folder_job(
+                        service.CHAT_EXPORT_MANAGER,
+                        account=account,
+                        username=username,
+                        output_dir=output_dir,
+                        export_format="html",
+                        message_types=current_types,
+                    )
+                    self.assertEqual(appended.status, "done", msg=appended.error)
+                    self.assertEqual(appended.incremental.get("messagesAdded"), 1)
+                    self.assertEqual(appended.progress.messages_exported, 1)
+                    self.assertFalse(appended.repair_candidates)
+                    self.assertTrue(appended.incremental.get("locationTypeSkipped"))
+                    self.assertIn("基线不含“位置”类型", appended.warning)
+                    current_html = message_file.read_text(encoding="utf-8")
+                    self.assertIn("升级后的新消息", current_html)
+                    self.assertNotIn("普通文本消息", current_html)
+                    self.assertNotIn(location_marker, current_html)
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    self.assertEqual(state["config"], baseline["config"])
+                    self.assertEqual(state["configFingerprint"], baseline["configFingerprint"])
+                finally:
+                    service._probe_incremental_conversation = original_full_probe
+            finally:
+                if previous is None:
+                    os.environ.pop("WECHAT_TOOL_DATA_DIR", None)
+                else:
+                    os.environ["WECHAT_TOOL_DATA_DIR"] = previous
+
+    def test_only_a_missing_location_type_keeps_the_baseline_config(self):
+        import wechat_decrypt_tool.chat_incremental_export as incremental
+
+        # 写进基线的是归一化后的 renderType。
+        legacy_types = sorted(value.lower() for value in self._LEGACY_DIALOG_MESSAGE_TYPES)
+        current_types = [*legacy_types, "location"]
+        partial_types = [value for value in legacy_types if value != "system"]
+
+        def build(message_types, **overrides):
+            values = {
+                "export_format": "html",
+                "start_time": None,
+                "end_time": None,
+                "message_types": message_types,
+                "include_media": True,
+                "media_kinds": ["image", "emoji", "video", "video_thumb", "voice", "file"],
+                "download_remote_media": False,
+                "html_page_size": 1000,
+                "privacy_mode": False,
+                "transcribe_voice": False,
+            }
+            values.update(overrides)
+            return incremental.build_config(**values)
+
+        fingerprint = incremental.config_fingerprint
+        # v2.4.0 起（远程缩略图改为默认关闭之后）、面板还没有“位置”时，
+        # 保持默认选项建立增量目录写进基线的配置指纹。
+        legacy_fingerprint = "cf8c33b421da906e8f144a30c9504867264488b4ab94d373e5e4d52813f681ea"
+        self.assertEqual(fingerprint(build(legacy_types)), legacy_fingerprint)
+
+        with TemporaryDirectory() as td:
+
+            def prepare(config, *, baseline_fingerprint=legacy_fingerprint, reset_baseline=False):
+                # 走浏览器回传基线的路径，不依赖磁盘上的目录。
+                return incremental.prepare_folder_context(
+                    account="wxid_incremental",
+                    exports_root=Path(td),
+                    requested_folder_name="聊天增量测试",
+                    config=config,
+                    privacy_mode=False,
+                    desktop_output=False,
+                    supplied_baseline={
+                        "schemaVersion": 1,
+                        "artifactType": "wechat-chat-incremental-folder",
+                        "account": "wxid_incremental",
+                        "folderName": "聊天增量测试",
+                        "conversationSalt": "salt",
+                        "configFingerprint": baseline_fingerprint,
+                        "conversations": {},
+                        "files": {},
+                    },
+                    missing_files=[],
+                    reset_baseline=reset_baseline,
+                )
+
+            kept = prepare(build(current_types))
+            self.assertTrue(kept.location_type_skipped)
+            self.assertEqual(kept.config, build(legacy_types))
+            self.assertEqual(kept.config_hash, legacy_fingerprint)
+
+            # 旧目录只勾选了部分类型时，重复同样的勾选也会多带一个默认勾选的位置。
+            kept_partial = prepare(
+                build([*partial_types, "location"]),
+                baseline_fingerprint=fingerprint(build(partial_types)),
+            )
+            self.assertTrue(kept_partial.location_type_skipped)
+            self.assertEqual(kept_partial.config, build(partial_types))
+
+            unchanged = prepare(build(legacy_types))
+            self.assertFalse(unchanged.location_type_skipped)
+            self.assertEqual(unchanged.config_hash, legacy_fingerprint)
+
+            reset = prepare(build(current_types), reset_baseline=True)
+            self.assertFalse(reset.location_type_skipped)
+            self.assertEqual(reset.config, build(current_types))
+            self.assertEqual(reset.config_hash, fingerprint(build(current_types)))
+
+            mismatches = {
+                "其它配置不同": (build(current_types, export_format="json"), legacy_fingerprint),
+                "分页不同": (build(current_types, html_page_size=500), legacy_fingerprint),
+                "少勾了其它类型": (build([*partial_types, "location"]), legacy_fingerprint),
+                "多勾了其它类型": (build(current_types), fingerprint(build(partial_types))),
+                # 空清单表示导出全部类型，本来就包含位置。
+                "只勾选位置": (build(["location"]), fingerprint(build([]))),
+                "基线已含位置": (build(legacy_types), fingerprint(build(current_types))),
+            }
+            for label, (config, baseline_fingerprint) in mismatches.items():
+                with self.subTest(label):
+                    with self.assertRaises(incremental.ChatIncrementalError) as captured:
+                        prepare(config, baseline_fingerprint=baseline_fingerprint)
+                    self.assertEqual(captured.exception.code, "incremental_config_mismatch")
 
     def test_unselected_conversation_is_preserved_and_missing_file_is_restored(self):
         with TemporaryDirectory() as td:

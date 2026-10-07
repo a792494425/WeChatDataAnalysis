@@ -70,6 +70,7 @@ from .chat_incremental_export import (
     materialize_folder_archive,
     missing_conversation_keys,
     normalize_pending_media,
+    ordered_conversation_keys,
     prepare_folder_context,
 )
 from .logging_config import get_logger
@@ -1224,16 +1225,9 @@ def _replace_ordered_export_index_item(
     index: dict[str, dict[str, Any]],
     item: dict[str, Any],
 ) -> None:
-    """Replace an index item while retaining the old remove-then-append order.
-
-    ``dict`` preserves insertion order.  Removing the existing conversation
-    before assigning it again is therefore equivalent to the previous
-    ``[... if convDir != current]`` plus ``append`` implementation, without
-    rescanning the complete index for every conversation.
-    """
+    """Update existing entries in place and append newly exported conversations."""
 
     conv_dir = str(item.get("convDir") or "")
-    index.pop(conv_dir, None)
     index[conv_dir] = item
 
 
@@ -2172,6 +2166,13 @@ class ChatExportManager:
                 missing_files=list(opts.get("missingFiles") or []),
                 reset_baseline=bool(opts.get("resetBaseline")),
             )
+            if folder_context.location_type_skipped:
+                # 探测、渲染都要和基线用同一份类型清单，否则已导出的历史会被误判为有差异。
+                want_types = set(folder_context.config.get("messageTypes") or [])
+                job.options["messageTypes"] = [
+                    value for value in message_types_raw if _normalize_render_type_key(value) in want_types
+                ]
+                _safe_trace(trace, "incremental_location_type_skipped", messageTypes=sorted(want_types))
             preferred_missing_owner_keys = {
                 incremental_conversation_key(salt=folder_context.salt, username=username)
                 for username in target_usernames
@@ -2491,10 +2492,8 @@ class ChatExportManager:
                 )
                 _safe_trace(trace, "zip_opened", durationMs=_elapsed_ms(phase_started))
                 # Keep the indexes keyed by conversation directory while the
-                # export is running.  Folder exports replace existing entries
-                # and intentionally move them to the end; dict pop+assign
-                # preserves that order in O(1), unlike filtering a growing
-                # list for every conversation.
+                # export is running. Assignment preserves existing positions
+                # in O(1), and new conversations are appended at the end.
                 html_index_by_conv_dir: dict[str, dict[str, Any]] = {}
                 excel_index_by_conv_dir: dict[str, dict[str, Any]] = {}
                 html_index_items: list[dict[str, Any]] = []
@@ -2508,7 +2507,8 @@ class ChatExportManager:
                         if isinstance(folder_context.old_state.get("conversations"), dict)
                         else {}
                     )
-                    for old_value in old_conversations.values():
+                    for old_key in ordered_conversation_keys(folder_context.old_state):
+                        old_value = old_conversations[old_key]
                         if not isinstance(old_value, dict):
                             continue
                         old_session = old_value.get("session")
@@ -2751,7 +2751,11 @@ class ChatExportManager:
 
                         session_value = {
                             "username": "" if privacy_mode else conv_username,
-                            "displayName": (f"会话 {idx:04d}" if privacy_mode else conv_name),
+                            "displayName": (
+                                str((session_items_by_conv_dir.get(conv_dir) or {}).get("displayName")
+                                    or f"会话 {len(session_items_by_conv_dir) + 1:04d}")
+                                if privacy_mode else conv_name
+                            ),
                             "isGroup": bool(conv_is_group),
                             "convDir": conv_dir,
                             "avatarPath": "" if privacy_mode else conv_avatar_path,
@@ -3655,6 +3659,10 @@ class ChatExportManager:
                 warning_parts: list[str] = []
                 if folder_context.reset_baseline:
                     warning_parts.append("已重置基线并完整重建本次选择的会话。")
+                if folder_context.location_type_skipped:
+                    warning_parts.append(
+                        "该增量目录的基线不含“位置”类型，本次仍按基线的消息类型更新，未导出位置消息；需要时请重置增量基线或改用新目录。"
+                    )
                 recovered_files = int(job.incremental.get("filesRecovered") or 0)
                 if recovered_files:
                     warning_parts.append(f"已补回 {recovered_files} 个缺失或异常的受管理文件。")
